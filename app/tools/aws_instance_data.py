@@ -11,9 +11,12 @@ while the API actually returns "vCPU", so it always parses as 0.
 
 from __future__ import annotations
 
+import http.client
+import time
 from typing import Any
 
 import httpx
+
 try:
     from instances_api_client.client import GLOBAL_SERVICES_JSON_URLS, USER_AGENT
 except ImportError:
@@ -30,6 +33,25 @@ class InstanceDataUnavailableError(RuntimeError):
     """Raised when live EC2 instance data cannot be retrieved."""
 
 
+_RETRYABLE_EXCEPTIONS = (
+    httpx.TransportError,
+    httpx.TimeoutException,
+    httpx.DecodingError,
+    httpx.RemoteProtocolError,
+    http.client.IncompleteRead,
+    http.client.RemoteDisconnected,
+    http.client.HTTPException,
+)
+
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    if isinstance(exc, _RETRYABLE_EXCEPTIONS):
+        return True
+    if isinstance(exc, httpx.RequestError):
+        return True
+    return False
+
+
 def _auth_headers() -> dict[str, str]:
     try:
         settings = get_vantage_settings()
@@ -38,19 +60,43 @@ def _auth_headers() -> dict[str, str]:
     return {"User-Agent": USER_AGENT, "Authorization": f"Bearer {settings.api_key}"}
 
 
-def _get_json(url: str) -> Any:
-    try:
-        resp = httpx.get(url, headers=_auth_headers(), timeout=30.0)
-    except httpx.RequestError as exc:
-        raise InstanceDataUnavailableError(f"Failed to reach {url}: {exc}") from exc
+def _get_json(url: str, max_attempts: int = 3, backoff_base: float = 1.0) -> Any:
+    headers = _auth_headers()
+    last_error_msg = ""
 
-    if resp.status_code != 200:
-        raise InstanceDataUnavailableError(f"{url} returned {resp.status_code}: {resp.text}")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = httpx.get(url, headers=headers, timeout=30.0)
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except (ValueError, httpx.DecodingError) as exc:
+                    if isinstance(exc, httpx.DecodingError):
+                        last_error_msg = str(exc) or "Incomplete chunked read"
+                    else:
+                        raise InstanceDataUnavailableError(
+                            f"Invalid JSON from {url}: {exc}"
+                        ) from None
+            elif resp.status_code in {500, 502, 503, 504}:
+                last_error_msg = f"HTTP {resp.status_code}: {resp.text}"
+            else:
+                raise InstanceDataUnavailableError(
+                    f"{url} returned {resp.status_code}: {resp.text}"
+                ) from None
+        except InstanceDataUnavailableError:
+            raise
+        except Exception as exc:
+            if _is_retryable_exception(exc):
+                last_error_msg = str(exc) or exc.__class__.__name__
+            else:
+                raise InstanceDataUnavailableError(f"Failed to reach {url}: {exc}") from None
 
-    try:
-        return resp.json()
-    except ValueError as exc:
-        raise InstanceDataUnavailableError(f"Invalid JSON from {url}: {exc}") from exc
+        if attempt < max_attempts:
+            time.sleep(backoff_base * (2 ** (attempt - 1)))
+
+    raise InstanceDataUnavailableError(
+        f"Failed to reach {url} after {max_attempts} attempts: {last_error_msg}"
+    ) from None
 
 
 def _item_to_candidate(item: dict[str, Any]) -> InstanceCandidate | None:
