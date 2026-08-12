@@ -1,0 +1,10 @@
+langchain
+langgraph
+pydantic
+openai
+langchain-openai
+langchain-tavily
+python-dotenv
+httpx
+pytest
+instances-api-client
