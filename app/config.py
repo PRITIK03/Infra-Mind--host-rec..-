@@ -46,6 +46,10 @@ class LLMSettings:
     base_url: str
     model_name: str
     max_tokens: int = 8192
+    # Caps the model's internal reasoning/"thinking" budget as a subset of
+    # max_tokens (not in addition to it). Keep meaningfully smaller than
+    # max_tokens so visible JSON output still has room.
+    reasoning_max_tokens: int = 2048
     api_key_secondary: str | None = None
 
 
@@ -70,6 +74,7 @@ def get_llm_settings() -> LLMSettings:
         base_url=_require("BASE_URL"),
         model_name=_require("MODEL_NAME"),
         max_tokens=_optional_int("LLM_MAX_TOKENS", 8192),
+        reasoning_max_tokens=_optional_int("LLM_REASONING_MAX_TOKENS", 2048),
         api_key_secondary=os.getenv("API_KEY_2") or None,
     )
 

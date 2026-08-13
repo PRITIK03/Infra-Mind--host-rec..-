@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.agent.nodes.system_design_reasoner import (
+    _PROMPT_TEMPLATE,
     _apply_deterministic_requirement_bridges,
     _maybe_collect_research,
     ReasoningError,
@@ -37,6 +38,20 @@ def _needs(**kwargs) -> TechnicalNeeds:
     )
     base.update(kwargs)
     return TechnicalNeeds(**base)
+
+
+def test_prompt_requires_scaling_consistent_with_low_concurrency():
+    """
+    Bursty traffic must not auto-imply horizontal scaling when concurrency
+    is too low to distribute (e.g. a single batch job/worker slot).
+    """
+    prompt = _PROMPT_TEMPLATE.lower()
+    assert "scaling_recommendation must be consistent with estimated_concurrency" in prompt
+    assert "1-3" in prompt or "single digits" in prompt
+    assert "horizontal scaling isn't justified" in prompt or (
+        "horizontal scaling only makes sense" in prompt
+        and "estimated_concurrency is very low" in prompt
+    )
 
 
 def test_gpu_bridge_forces_requires_gpu_and_profile():

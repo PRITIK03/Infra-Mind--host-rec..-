@@ -32,6 +32,32 @@ class StructuredOutputError(RuntimeError):
     """Raised when the LLM fails to produce valid structured output."""
 
 
+def _reasoning_effort_for_budget(reasoning_max_tokens: int, max_tokens: int) -> str:
+    """
+    Map a reasoning token budget onto OpenRouter's effort enum.
+
+    OpenRouter allows either ``reasoning.max_tokens`` OR ``reasoning.effort``,
+    not both. Several models reached via ``openrouter/free`` (notably some
+    Cohere free routes) ignore ``reasoning.max_tokens`` and can still consume
+    the entire completion budget on hidden reasoning. Effort is honored more
+    broadly, so we derive it from ``reasoning_max_tokens / max_tokens``.
+    """
+    if max_tokens <= 0 or reasoning_max_tokens <= 0:
+        return "none"
+    ratio = reasoning_max_tokens / max_tokens
+    # OpenRouter approximate allocations: high~80%, medium~50%, low~20%,
+    # minimal~10%, none=off.
+    if ratio >= 0.8:
+        return "high"
+    if ratio >= 0.5:
+        return "medium"
+    if ratio >= 0.2:
+        return "low"
+    if ratio >= 0.05:
+        return "minimal"
+    return "none"
+
+
 @lru_cache(maxsize=2)
 def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
     """
@@ -53,6 +79,9 @@ def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
             )
         api_key = settings.api_key_secondary
 
+    effort = _reasoning_effort_for_budget(
+        settings.reasoning_max_tokens, settings.max_tokens
+    )
     return ChatOpenAI(
         api_key=api_key,
         base_url=settings.base_url,
@@ -61,6 +90,13 @@ def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
         max_tokens=settings.max_tokens,
         max_retries=3,
         timeout=30,
+        # Cap hidden reasoning so JSON output still has room. OpenRouter
+        # rejects setting both effort and max_tokens; effort is used because
+        # reasoning.max_tokens is ignored by some free-router models.
+        # Assumption: OpenAI-compatible endpoints ignore unrecognized body
+        # fields rather than erroring — revisit if switching away from
+        # OpenRouter to a provider that rejects unknown keys.
+        extra_body={"reasoning": {"effort": effort}},
     )
 
 

@@ -55,6 +55,17 @@ recommend horizontal scaling for steady traffic solely because the
 user base might grow later — that is a separate, future capacity
 planning concern, not today's scaling strategy.
 
+scaling_recommendation must be consistent with estimated_concurrency.
+Horizontal scaling only makes sense when there is enough concurrent
+load to meaningfully distribute across multiple instances. If
+estimated_concurrency is very low (roughly single digits, e.g. 1-3
+concurrent users or job/worker slots), prefer vertical scaling or a
+single right-sized instance even if traffic_pattern is bursty — note
+in your reasoning that horizontal scaling isn't justified at this
+concurrency level. Reserve horizontal/auto-scaling recommendations
+for cases where concurrency is high enough that spreading load across
+multiple instances is actually meaningful.
+
 Also, if workload_type is batch_processing, frame estimated_concurrency
 as concurrent job/worker slots rather than concurrent human users,
 and say so explicitly in your reasoning, since the two are conceptually

@@ -772,3 +772,79 @@ def test_scenario_13_invented_instance_is_rejected():
             technical_needs=needs,
             recommendation=recommendation,
         )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 14 — Low-concurrency bursty batch must not assume a cluster
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_14_low_concurrency_bursty_batch_prefers_single_instance():
+    """
+    "1 job runs at a time" + bursty schedule must stay internally consistent:
+    vertical / single right-sized instance, not horizontal cluster assumptions.
+    """
+    from app.agent.nodes.system_design_reasoner import _PROMPT_TEMPLATE as reasoner_prompt
+
+    assert "scaling_recommendation must be consistent with estimated_concurrency" in (
+        reasoner_prompt.lower()
+    )
+
+    requirements = UserRequirements(
+        workload_type=WorkloadType.BATCH_PROCESSING,
+        estimated_concurrent_users=1,
+        traffic_pattern=TrafficPattern.BURSTY,
+        resource_profile=ResourceProfile.CPU_BOUND,
+        gpu_required=False,
+        additional_notes="Nightly batch job; just 1 job runs at a time.",
+    )
+    needs = TechnicalNeeds(
+        estimated_concurrency=1,
+        resource_profile=ResourceProfile.CPU_BOUND,
+        traffic_pattern=TrafficPattern.BURSTY,
+        requires_gpu=False,
+        scaling_recommendation=(
+            "vertical / single right-sized instance — concurrency is 1 job "
+            "slot so horizontal scaling is not justified"
+        ),
+        reasoning=(
+            "Only one job/worker runs at a time, so there is nothing meaningful "
+            "to distribute across instances despite a bursty nightly schedule."
+        ),
+    )
+    recommendation = InstanceRecommendation(
+        recommended_instance="c6i.xlarge",
+        why="Right-sized single compute instance for one concurrent batch job",
+        assumptions=[
+            "estimated_concurrency=1 means a single job/worker slot",
+            "sizing for full concurrency on one instance, not a share of a cluster",
+        ],
+        confidence="high",
+        alternative_instance="c7i.xlarge",
+        trade_off="Newer generation at similar shape",
+    )
+
+    final = _run_graph_to_recommendation(
+        initial_requirements=requirements,
+        technical_needs=needs,
+        recommendation=recommendation,
+    )
+
+    tn = final["technical_needs"]
+    assert tn.estimated_concurrency == 1
+    assert tn.traffic_pattern == TrafficPattern.BURSTY
+    scaling = tn.scaling_recommendation.lower()
+    assert "horizontal" not in scaling or "not justified" in scaling
+    assert "vertical" in scaling or "single" in scaling
+
+    rec = final["recommendation"]
+    joined = " ".join([rec.why, *rec.assumptions]).lower()
+    assert "split across several" not in joined
+    assert "across multiple instances" not in joined
+    assert any(
+        "single" in a.lower() or "one instance" in a.lower() or "concurrency=1" in a.lower()
+        for a in rec.assumptions
+    )
+    assert rec.recommended_instance in {
+        c.instance_type for c in final["instance_candidates"]
+    }
