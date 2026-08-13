@@ -19,6 +19,7 @@ from app.agent.nodes.requirement_collector import (
 from app.llm.client import StructuredOutputError, invoke_structured
 from app.models.schemas import (
     InstanceRecommendation,
+    ResourceProfile,
     TrafficPattern,
     TechnicalNeeds,
     UserRequirements,
@@ -339,6 +340,123 @@ def test_invoke_structured_missing_recommendation_data_fails_cleanly(mock_get_mo
 
 
 @patch("app.llm.client.get_chat_model")
+def test_invoke_structured_retries_once_on_validation_error(mock_get_model):
+    """
+    Missing required fields fail the first primary+fallback unit, then the
+    bounded outer retry succeeds with valid JSON.
+    """
+    model = MagicMock()
+    incomplete = AIMessage(
+        content=(
+            '{"estimated_concurrency":100,'
+            '"resource_profile":"balanced",'
+            '"traffic_pattern":"steady",'
+            '"requires_gpu":false,'
+            '"reasoning":"forgot scaling"}'
+        )
+    )
+    complete = AIMessage(
+        content=(
+            '{"estimated_concurrency":100,'
+            '"resource_profile":"balanced",'
+            '"traffic_pattern":"steady",'
+            '"requires_gpu":false,'
+            '"scaling_recommendation":"vertical",'
+            '"reasoning":"complete after retry"}'
+        )
+    )
+    model.invoke.side_effect = [incomplete, complete]
+    model.with_structured_output.return_value.invoke.side_effect = TypeError(
+        "'NoneType' object is not iterable"
+    )
+    mock_get_model.return_value = model
+
+    result = invoke_structured(TechnicalNeeds, "Extract technical needs")
+    assert result.scaling_recommendation == "vertical"
+    assert result.reasoning == "complete after retry"
+    assert model.invoke.call_count == 2
+
+    retry_prompt = model.invoke.call_args_list[1].args[0]
+    assert "did not contain valid JSON matching the required schema" in retry_prompt
+    assert "ONLY a valid JSON object" in retry_prompt
+    assert "No other text, labels, or commentary" in retry_prompt
+
+
+@patch("app.llm.client.get_chat_model")
+def test_invoke_structured_retries_once_on_non_json_safety_tag(mock_get_model):
+    """
+    Completely non-JSON content (e.g. a stray safety/moderation tag) fails
+    the first attempt unit, then the bounded retry recovers with valid JSON.
+    """
+    model = MagicMock()
+    safety_tag = AIMessage(content="User Safety: safe")
+    valid = AIMessage(
+        content=(
+            '{"estimated_concurrency":200,'
+            '"resource_profile":"balanced",'
+            '"traffic_pattern":"bursty",'
+            '"requires_gpu":false,'
+            '"scaling_recommendation":"horizontal with auto scaling",'
+            '"reasoning":"flash-sale spikes"}'
+        )
+    )
+    model.invoke.side_effect = [safety_tag, valid]
+    model.with_structured_output.return_value.invoke.side_effect = TypeError(
+        "Invalid json output: User Safety: safe"
+    )
+    mock_get_model.return_value = model
+
+    result = invoke_structured(TechnicalNeeds, "Extract technical needs")
+    assert result.estimated_concurrency == 200
+    assert result.traffic_pattern == TrafficPattern.BURSTY
+    assert model.invoke.call_count == 2
+
+    retry_prompt = model.invoke.call_args_list[1].args[0]
+    assert "did not contain valid JSON matching the required schema" in retry_prompt
+    assert "non-JSON content" in retry_prompt
+
+
+@patch("app.llm.client.get_chat_model")
+def test_invoke_structured_technical_needs_defaults_unknown_after_retry(
+    mock_get_model,
+):
+    """
+    If resource_profile / traffic_pattern are still omitted after the
+    outer retry, TechnicalNeeds falls back to UNKNOWN instead of raising.
+    """
+    model = MagicMock()
+    # First attempt missing a still-required field → unit fails (fallback also fails).
+    missing_required = AIMessage(
+        content=(
+            '{"estimated_concurrency":40,'
+            '"requires_gpu":false,'
+            '"reasoning":"incomplete"}'
+        )
+    )
+    # Retry still omits resource_profile and traffic_pattern — defaults apply.
+    missing_optionalish = AIMessage(
+        content=(
+            '{"estimated_concurrency":40,'
+            '"requires_gpu":false,'
+            '"scaling_recommendation":"vertical",'
+            '"reasoning":"profiles omitted"}'
+        )
+    )
+    model.invoke.side_effect = [missing_required, missing_optionalish]
+    model.with_structured_output.return_value.invoke.side_effect = TypeError(
+        "'NoneType' object is not iterable"
+    )
+    mock_get_model.return_value = model
+
+    result = invoke_structured(TechnicalNeeds, "Extract technical needs")
+    assert result.estimated_concurrency == 40
+    assert result.resource_profile == ResourceProfile.UNKNOWN
+    assert result.traffic_pattern == TrafficPattern.UNKNOWN
+    assert result.scaling_recommendation == "vertical"
+    assert model.invoke.call_count == 2
+
+
+@patch("app.llm.client.get_chat_model")
 def test_invoke_structured_invalid_enum_fails_cleanly(mock_get_model):
     model = MagicMock()
     # resource_profile expects cpu_bound/memory_bound/...; provide an invalid value.
@@ -359,3 +477,5 @@ def test_invoke_structured_invalid_enum_fails_cleanly(mock_get_model):
 
     with pytest.raises(StructuredOutputError):
         invoke_structured(TechnicalNeeds, "Extract technical needs")
+    # First attempt unit + one outer retry (primary invoke each time).
+    assert model.invoke.call_count == 2

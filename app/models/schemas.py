@@ -120,8 +120,14 @@ class TechnicalNeeds(BaseModel):
         ..., ge=0,
         description="Reasoner's best estimate of concurrent load, derived from users/RPS/stated concurrency.",
     )
-    resource_profile: ResourceProfile
-    traffic_pattern: TrafficPattern
+    resource_profile: ResourceProfile = Field(
+        default=ResourceProfile.UNKNOWN,
+        description="Dominant resource bottleneck; UNKNOWN if the model omitted it.",
+    )
+    traffic_pattern: TrafficPattern = Field(
+        default=TrafficPattern.UNKNOWN,
+        description="Traffic shape; UNKNOWN if the model omitted it.",
+    )
     requires_gpu: bool = False
     scaling_recommendation: str = Field(
         ...,

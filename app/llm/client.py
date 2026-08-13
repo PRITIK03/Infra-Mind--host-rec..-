@@ -200,6 +200,34 @@ def _normalize_instance_recommendation_payload(
     return normalized
 
 
+def _validate_structured_payload(schema: type[T], data: object) -> T:
+    """
+    Validate parsed JSON against *schema*, with narrow TechnicalNeeds unwrap.
+    """
+    try:
+        normalized = _normalize_instance_recommendation_payload(schema, data)
+        return schema.model_validate(normalized)
+    except ValidationError:
+        # Narrow contract-mismatch handling for known wrapper shape:
+        # { "reasoning": "...", "technical_needs": { ...TechnicalNeeds... } }
+        if schema.__name__ == "TechnicalNeeds" and isinstance(data, dict):
+            inner = data.get("technical_needs")
+            if isinstance(inner, dict):
+                candidate = dict(inner)
+                if "reasoning" in data and "reasoning" not in candidate:
+                    candidate["reasoning"] = data["reasoning"]
+                return schema.model_validate(candidate)
+        raise
+
+
+_JSON_RETRY_NOTE = (
+    "Your previous response did not contain valid JSON matching the required "
+    "schema — it may have included non-JSON content or been incomplete. "
+    "Respond with ONLY a valid JSON object matching the schema. No other text, "
+    "labels, or commentary."
+)
+
+
 def invoke_structured(schema: type[T], prompt: str) -> T:
     """
     Provider-agnostic structured extraction into a Pydantic schema.
@@ -212,75 +240,86 @@ def invoke_structured(schema: type[T], prompt: str) -> T:
     Secondary path: LangChain `with_structured_output(..., method="json_mode")`
     if the primary path fails — still validated as the schema type when possible.
 
+    The primary + fallback pair is treated as one attempt. If that whole
+    attempt fails for any reason (empty/non-JSON content, missing fields,
+    provider parse errors, etc.), it is retried exactly once with a corrective
+    instruction. Rate-limit errors still propagate immediately after failover.
+
     Both paths are routed through _call_with_failover() for automatic
     rate-limit failover when a secondary API key is configured.
     """
     schema_name = schema.__name__
     schema_json = json.dumps(schema.model_json_schema(), indent=2)
-    json_prompt = (
-        f"{prompt}\n\n"
-        f"Return a single JSON object only (no markdown fences, no commentary) "
-        f"that conforms to this JSON Schema for {schema_name}:\n"
-        f"{schema_json}\n"
-        f"Omit fields that are unknown or not supported by the evidence; "
-        f"do not invent values."
-    )
 
-    primary_error: Exception | None = None
-    try:
-        def _primary(model: ChatOpenAI):
-            response = model.invoke(json_prompt)
-            text = _message_text(response)
-            data = _parse_json_object(text)
-            try:
-                normalized = _normalize_instance_recommendation_payload(schema, data)
-                return schema.model_validate(normalized)
-            except ValidationError:
-                # Narrow contract-mismatch handling for known wrapper shape:
-                # { "reasoning": "...", "technical_needs": { ...TechnicalNeeds... } }
-                # Some models do this despite the schema request. We only
-                # unwrap TechnicalNeeds and only when the unwrapped payload
-                # validates; otherwise we re-raise the original validation error.
-                if schema.__name__ == "TechnicalNeeds" and isinstance(data, dict):
-                    inner = data.get("technical_needs")
-                    if isinstance(inner, dict):
-                        candidate = dict(inner)
-                        if "reasoning" in data and "reasoning" not in candidate:
-                            candidate["reasoning"] = data["reasoning"]
-                        return schema.model_validate(candidate)
-                raise
+    def _run_attempt(active_prompt: str) -> T:
+        json_prompt = (
+            f"{active_prompt}\n\n"
+            f"Return a single JSON object only (no markdown fences, no commentary) "
+            f"that conforms to this JSON Schema for {schema_name}:\n"
+            f"{schema_json}\n"
+            f"Omit fields that are unknown or not supported by the evidence; "
+            f"do not invent values."
+        )
 
-        return _call_with_failover(_primary)
-    except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        primary_error = exc
-    except RateLimitError:
-        raise  # already exhausted both keys in _call_with_failover
-    except Exception as exc:
-        # Provider/SDK parse failures (e.g. choices=None) land here.
-        primary_error = exc
+        primary_error: Exception | None = None
+        try:
+            def _primary(model: ChatOpenAI):
+                response = model.invoke(json_prompt)
+                text = _message_text(response)
+                data = _parse_json_object(text)
+                return _validate_structured_payload(schema, data)
 
-    # Fallback: json_mode structured output (more compatible than json_schema).
-    try:
-        def _fallback(model: ChatOpenAI):
-            structured = model.with_structured_output(schema, method="json_mode")
-            result = structured.invoke(
-                f"{prompt}\n\nRespond with a JSON object matching the {schema_name} schema."
-            )
-            if result is None:
-                raise StructuredOutputError(
-                    f"LLM returned no {schema_name} object (empty structured response)."
+            return _call_with_failover(_primary)
+        except RateLimitError:
+            raise
+        except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            primary_error = exc
+        except Exception as exc:
+            # Provider/SDK parse failures (e.g. choices=None) land here.
+            primary_error = exc
+
+        try:
+            def _fallback(model: ChatOpenAI):
+                structured = model.with_structured_output(schema, method="json_mode")
+                result = structured.invoke(
+                    f"{active_prompt}\n\n"
+                    f"Respond with a JSON object matching the {schema_name} schema."
                 )
-            if isinstance(result, schema):
-                return result
-            normalized = _normalize_instance_recommendation_payload(schema, result)
-            return schema.model_validate(normalized)
+                if result is None:
+                    raise StructuredOutputError(
+                        f"LLM returned no {schema_name} object (empty structured response)."
+                    )
+                if isinstance(result, schema):
+                    return result
+                normalized = _normalize_instance_recommendation_payload(schema, result)
+                return schema.model_validate(normalized)
 
-        return _call_with_failover(_fallback)
-    except StructuredOutputError:
+            return _call_with_failover(_fallback)
+        except RateLimitError:
+            raise
+        except StructuredOutputError:
+            raise
+        except Exception as fallback_exc:
+            raise StructuredOutputError(
+                f"Failed to obtain valid {schema_name} from the LLM. "
+                f"JSON extraction error: {primary_error}. "
+                f"Structured-output fallback error: {fallback_exc}"
+            ) from fallback_exc
+
+    try:
+        return _run_attempt(prompt)
+    except RateLimitError:
         raise
-    except Exception as fallback_exc:
-        raise StructuredOutputError(
-            f"Failed to obtain valid {schema_name} from the LLM. "
-            f"JSON extraction error: {primary_error}. "
-            f"Structured-output fallback error: {fallback_exc}"
-        ) from fallback_exc
+    except Exception:
+        # One bounded retry of the entire primary+fallback unit — do not loop.
+        try:
+            return _run_attempt(f"{prompt}\n\n{_JSON_RETRY_NOTE}")
+        except RateLimitError:
+            raise
+        except StructuredOutputError:
+            raise
+        except Exception as retry_exc:
+            raise StructuredOutputError(
+                f"Failed to obtain valid {schema_name} from the LLM after retry. "
+                f"Last error: {retry_exc}"
+            ) from retry_exc

@@ -96,6 +96,37 @@ Output contract (very important):
 """
 
 
+def _invalid_instance_types(
+    result: InstanceRecommendation, allowed: set[str]
+) -> list[str]:
+    """Return invented instance types from the recommendation (if any)."""
+    invalid: list[str] = []
+    if result.recommended_instance not in allowed:
+        invalid.append(result.recommended_instance)
+    if (
+        result.alternative_instance is not None
+        and result.alternative_instance not in allowed
+    ):
+        invalid.append(result.alternative_instance)
+    return invalid
+
+
+def _correction_prompt(
+    base_prompt: str,
+    *,
+    invalid_instances: list[str],
+    allowed_types: list[str],
+) -> str:
+    invalid_joined = ", ".join(repr(t) for t in invalid_instances)
+    allowed_joined = ", ".join(allowed_types)
+    return (
+        f"{base_prompt}\n\n"
+        f"Your previous answer suggested {invalid_joined}, which is not one "
+        f"of the available options. You MUST choose recommended_instance and "
+        f"alternative_instance only from this exact list: {allowed_joined}."
+    )
+
+
 def recommend_instance(state: AgentState) -> AgentState:
     needs = state["technical_needs"]
     requirements = state["requirements"]
@@ -126,12 +157,26 @@ def recommend_instance(state: AgentState) -> AgentState:
         raise RecommendationError(str(exc)) from exc
 
     allowed = {c.instance_type for c in candidates}
-    if result.recommended_instance not in allowed:
-        raise RecommendationError(
-            f"Model recommended {result.recommended_instance!r}, which is not in the live candidate set."
+    allowed_list = [c.instance_type for c in candidates]
+    invalid = _invalid_instance_types(result, allowed)
+
+    if invalid:
+        # One bounded retry — do not loop indefinitely.
+        retry_prompt = _correction_prompt(
+            prompt,
+            invalid_instances=invalid,
+            allowed_types=allowed_list,
         )
-    if result.alternative_instance and result.alternative_instance not in allowed:
-        result = result.model_copy(update={"alternative_instance": None, "trade_off": None})
+        try:
+            result = invoke_structured(InstanceRecommendation, retry_prompt)
+        except StructuredOutputError as exc:
+            raise RecommendationError(str(exc)) from exc
+
+        invalid = _invalid_instance_types(result, allowed)
+        if invalid:
+            raise RecommendationError(
+                f"Model recommended {invalid[0]!r}, which is not in the live candidate set."
+            )
 
     state["recommendation"] = result
     return state

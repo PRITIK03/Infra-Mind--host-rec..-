@@ -151,8 +151,10 @@ def test_scenario_1_small_steady_web_app_non_gpu_and_live_candidate():
         why="Balanced general-purpose size for steady modest concurrency",
         assumptions=["concurrency near 80"],
         confidence="medium",
-        alternative_instance="t3.large",
-        trade_off="Burstable is cheaper but less consistent CPU",
+        # Must be in the researcher's filtered set (balanced m-family at
+        # concurrency 80 — burstable t3 is excluded).
+        alternative_instance="m5.xlarge",
+        trade_off="More headroom at higher cost",
     )
 
     final = _run_graph_to_recommendation(

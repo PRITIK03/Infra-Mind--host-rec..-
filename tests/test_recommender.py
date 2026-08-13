@@ -47,73 +47,111 @@ def _base_state(recommendation: InstanceRecommendation):
     }
 
 
+def _rec(
+    recommended: str,
+    *,
+    alternative: str | None = None,
+    why: str = "ok",
+) -> InstanceRecommendation:
+    return InstanceRecommendation(
+        recommended_instance=recommended,
+        why=why,
+        assumptions=["test assumption"],
+        confidence="medium",
+        alternative_instance=alternative,
+        trade_off="n/a" if alternative else None,
+    )
+
+
 @patch("app.agent.nodes.recommender.invoke_structured")
 def test_recommend_instance_accepts_candidate_from_live_set(mock_invoke):
-    recommendation = InstanceRecommendation(
-        recommended_instance="m5.large",
-        why="Fits share of bursty load",
-        assumptions=["4 replicas"],
-        confidence="medium",
-        alternative_instance="m5.xlarge",
-        trade_off="More headroom, higher cost",
-    )
-    mock_invoke.return_value = recommendation
-
-    state = _base_state(recommendation)
-    state = recommend_instance(state)
-    assert state["recommendation"].recommended_instance == "m5.large"
-
-
-@patch("app.agent.nodes.recommender.invoke_structured")
-def test_recommend_instance_rejects_invented_instance_type(mock_invoke):
-    recommendation = InstanceRecommendation(
-        recommended_instance="m5.fantasy",
-        why="made up",
-        assumptions=[],
-        confidence="low",
-        alternative_instance=None,
-        trade_off=None,
-    )
-    mock_invoke.return_value = recommendation
-
-    with pytest.raises(RecommendationError):
-        recommend_instance(_base_state(recommendation))
-
-
-@patch("app.agent.nodes.recommender.invoke_structured")
-def test_recommend_instance_clears_invalid_alternative(mock_invoke):
-    recommendation = InstanceRecommendation(
-        recommended_instance="m5.large",
-        why="ok",
-        assumptions=[],
-        confidence="medium",
-        alternative_instance="c6i.madeup",
-        trade_off="n/a",
-    )
+    recommendation = _rec("m5.large", alternative="m5.xlarge", why="Fits share of bursty load")
     mock_invoke.return_value = recommendation
 
     state = recommend_instance(_base_state(recommendation))
     assert state["recommendation"].recommended_instance == "m5.large"
-    assert state["recommendation"].alternative_instance is None
-    assert state["recommendation"].trade_off is None
+    assert mock_invoke.call_count == 1
+
+
+@patch("app.agent.nodes.recommender.invoke_structured")
+def test_recommend_instance_retries_once_then_accepts_valid_retry(mock_invoke):
+    invalid = _rec("m5.fantasy", why="made up")
+    valid = _rec("m5.large", alternative="m5.xlarge", why="corrected")
+    mock_invoke.side_effect = [invalid, valid]
+
+    state = recommend_instance(_base_state(invalid))
+    assert state["recommendation"].recommended_instance == "m5.large"
+    assert state["recommendation"].alternative_instance == "m5.xlarge"
+    assert mock_invoke.call_count == 2
+
+    retry_prompt = mock_invoke.call_args_list[1].args[1]
+    assert "m5.fantasy" in retry_prompt
+    assert "not one of the available options" in retry_prompt
+    assert "m5.large" in retry_prompt
+    assert "m5.xlarge" in retry_prompt
+    assert "You MUST choose recommended_instance and alternative_instance" in retry_prompt
+
+
+@patch("app.agent.nodes.recommender.invoke_structured")
+def test_recommend_instance_raises_after_two_invalid_attempts(mock_invoke):
+    first = _rec("m5.fantasy", why="made up")
+    second = _rec("m5.unicorn", why="still made up")
+    mock_invoke.side_effect = [first, second]
+
+    with pytest.raises(RecommendationError, match="not in the live candidate set"):
+        recommend_instance(_base_state(first))
+    assert mock_invoke.call_count == 2
+
+
+@patch("app.agent.nodes.recommender.invoke_structured")
+def test_recommend_instance_retries_when_alternative_is_invented(mock_invoke):
+    invalid_alt = _rec("m5.large", alternative="c6i.madeup")
+    valid = _rec("m5.large", alternative="m5.xlarge")
+    mock_invoke.side_effect = [invalid_alt, valid]
+
+    state = recommend_instance(_base_state(invalid_alt))
+    assert state["recommendation"].recommended_instance == "m5.large"
+    assert state["recommendation"].alternative_instance == "m5.xlarge"
+    assert mock_invoke.call_count == 2
+    retry_prompt = mock_invoke.call_args_list[1].args[1]
+    assert "c6i.madeup" in retry_prompt
+
+
+@patch("app.agent.nodes.recommender.invoke_structured")
+def test_recommend_instance_raises_when_retry_still_has_invented_alternative(
+    mock_invoke,
+):
+    bad = _rec("m5.large", alternative="c6i.madeup")
+    mock_invoke.return_value = bad
+
+    with pytest.raises(RecommendationError, match="c6i.madeup"):
+        recommend_instance(_base_state(bad))
+    assert mock_invoke.call_count == 2
+
+
+@patch("app.agent.nodes.recommender.invoke_structured")
+def test_recommend_instance_rejects_invented_instance_type(mock_invoke):
+    """Two invented recommendations in a row still fail after the single retry."""
+    recommendation = _rec("m5.fantasy", why="made up")
+    mock_invoke.return_value = recommendation
+
+    with pytest.raises(RecommendationError):
+        recommend_instance(_base_state(recommendation))
+    assert mock_invoke.call_count == 2
 
 
 @patch("app.agent.nodes.recommender.invoke_structured")
 def test_recommend_instance_prompt_requires_exact_instance_recommendation_schema(
     mock_invoke,
 ):
-    recommendation = InstanceRecommendation(
-        recommended_instance="m5.large",
+    recommendation = _rec(
+        "m5.large",
+        alternative="m5.xlarge",
         why="Fits the live candidate set",
-        assumptions=["steady traffic"],
-        confidence="medium",
-        alternative_instance="m5.xlarge",
-        trade_off="More headroom, more cost",
     )
     mock_invoke.return_value = recommendation
 
-    state = _base_state(recommendation)
-    recommend_instance(state)
+    recommend_instance(_base_state(recommendation))
 
     prompt = mock_invoke.call_args.args[1]
     assert "InstanceRecommendation schema" in prompt
