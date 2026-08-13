@@ -1,4 +1,4 @@
-# aws-instance-advisor
+# InfraMind x aws-instance-advisor
 
 AWS Instance Advisor is an AI agent that gathers your workload requirements, reasons about the underlying technical needs (CPU, memory, traffic pattern), researches live AWS EC2 instance data, and recommends the optimal EC2 instance type along with the reasoning behind the choice.
 
