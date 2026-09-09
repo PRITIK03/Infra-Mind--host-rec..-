@@ -61,8 +61,10 @@ def collect_requirements(state: AgentState) -> AgentState:
         "Only fill fields that are explicitly stated or clearly implied; "
         "leave everything else unset.\n\n"
         "Interpretation rules:\n"
+        "- If the user provides daily visitors, unique visitors, or total users (e.g. '50 visitors a day'), store the count in registered_users.\n"
         "- If the user provides concurrent jobs/workers/worker slots (common for "
         "batch or backend processing), store the number in estimated_concurrent_users.\n"
+        "- If the user describes a batch job with no live users, store 0 in registered_users.\n"
         "- If the user provides peak RPS (requests per second), store it in requests_per_second.\n"
         f"User message: {message}"
         + guidance
