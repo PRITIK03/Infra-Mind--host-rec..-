@@ -211,7 +211,7 @@ def test_retry_context_callback_called_on_rate_limit(monkeypatch):
 
     token = _retry_context.set(_cb)
     try:
-        with patch("app.llm.client.time.sleep"):
+        with patch("app.llm.retry.time.sleep"):
             result = _call_with_failover(_fail_twice_then_succeed)
     finally:
         _retry_context.reset(token)
@@ -233,7 +233,7 @@ def test_retry_context_not_called_when_first_attempt_succeeds(monkeypatch):
 
     token = _retry_context.set(lambda a, m: callback_calls.append((a, m)))
     try:
-        with patch("app.llm.client.time.sleep"):
+        with patch("app.llm.retry.time.sleep"):
             result = _call_with_failover(lambda _: "immediate-success")
     finally:
         _retry_context.reset(token)
@@ -249,7 +249,7 @@ def test_retry_context_default_none_no_error(monkeypatch):
     get_chat_model.cache_clear()
 
     # _retry_context defaults to None — must not cause any error
-    with patch("app.llm.client.time.sleep"):
+    with patch("app.llm.retry.time.sleep"):
         result = _call_with_failover(lambda _: "no-context-ok")
 
     assert result == "no-context-ok"
@@ -275,7 +275,7 @@ def test_retry_context_explicit_callback_overrides_context_var(monkeypatch):
 
     token = _retry_context.set(lambda a, m: context_calls.append((a, m)))
     try:
-        with patch("app.llm.client.time.sleep"):
+        with patch("app.llm.retry.time.sleep"):
             _call_with_failover(
                 _fail_once,
                 retry_callback=lambda a, m: explicit_calls.append((a, m)),

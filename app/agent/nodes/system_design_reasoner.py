@@ -19,7 +19,8 @@ import json
 from typing import Any
 
 from app.agent.state import AgentState
-from app.llm.client import StructuredOutputError, get_chat_model, invoke_structured
+from app.llm.client import get_chat_model
+from app.llm.structured import StructuredOutputError, invoke_structured
 from app.models.schemas import ResourceProfile, TechnicalNeeds, TrafficPattern
 from app.tools.web_search import try_get_search_tool
 

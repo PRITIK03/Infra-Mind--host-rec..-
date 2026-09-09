@@ -27,14 +27,16 @@ os.environ.setdefault("BASE_URL", "https://example.com/v1")
 os.environ.setdefault("MODEL_NAME", "test-model")
 os.environ.setdefault("VANTAGE_API_KEY", "vantage-test-key")
 
-from app.llm.client import (
-    MAX_RATE_LIMIT_ATTEMPTS,
+from app.llm.client import get_chat_model
+from app.llm.retry import (
     BACKOFF_BASE_S,
     BACKOFF_MAX_S,
+    MAX_RATE_LIMIT_ATTEMPTS,
     RateLimitExhaustedError,
-    StructuredOutputError,
     _call_with_failover,
-    get_chat_model,
+)
+from app.llm.structured import (
+    StructuredOutputError,
     invoke_structured,
 )
 from app.models.schemas import UserRequirements
@@ -69,7 +71,7 @@ def test_call_with_failover_exhausts_exactly_max_attempts_single_key(monkeypatch
         raise _make_rate_limit_error()
 
     # Patch sleep so the test runs instantly
-    with patch("app.llm.client.time.sleep"):
+    with patch("app.llm.retry.time.sleep"):
         with pytest.raises(RateLimitExhaustedError) as exc_info:
             _call_with_failover(_always_raises)
 
@@ -92,7 +94,7 @@ def test_call_with_failover_exhausts_exactly_max_attempts_two_keys(monkeypatch):
         used_secondary.append(model.openai_api_key.get_secret_value() == "secondary-key")
         raise _make_rate_limit_error()
 
-    with patch("app.llm.client.time.sleep"):
+    with patch("app.llm.retry.time.sleep"):
         with pytest.raises(RateLimitExhaustedError):
             _call_with_failover(_track_and_raise)
 
@@ -112,12 +114,12 @@ def test_call_with_failover_raises_RateLimitExhaustedError_not_raw_429(monkeypat
     monkeypatch.delenv("API_KEY_2", raising=False)
     get_chat_model.cache_clear()
 
-    with patch("app.llm.client.time.sleep"):
+    with patch("app.llm.retry.time.sleep"):
         with pytest.raises(RateLimitExhaustedError):
             _call_with_failover(lambda _: (_ for _ in ()).throw(_make_rate_limit_error()))
 
     # Confirm raw RateLimitError is NOT what bubbles up
-    with patch("app.llm.client.time.sleep"):
+    with patch("app.llm.retry.time.sleep"):
         try:
             _call_with_failover(lambda _: (_ for _ in ()).throw(_make_rate_limit_error()))
         except RateLimitExhaustedError:
@@ -139,7 +141,7 @@ def test_call_with_failover_succeeds_on_first_attempt(monkeypatch):
         call_count += 1
         return "ok"
 
-    with patch("app.llm.client.time.sleep") as mock_sleep:
+    with patch("app.llm.retry.time.sleep") as mock_sleep:
         result = _call_with_failover(_succeeds)
 
     assert result == "ok"
@@ -162,7 +164,7 @@ def test_call_with_failover_succeeds_on_second_attempt(monkeypatch):
             raise _make_rate_limit_error()
         return "recovered"
 
-    with patch("app.llm.client.time.sleep") as mock_sleep:
+    with patch("app.llm.retry.time.sleep") as mock_sleep:
         result = _call_with_failover(_fail_once)
 
     assert result == "recovered"
@@ -188,7 +190,7 @@ def test_call_with_failover_does_not_retry_non_rate_limit_error(monkeypatch):
         call_count += 1
         raise ValueError("something else went wrong")
 
-    with patch("app.llm.client.time.sleep") as mock_sleep:
+    with patch("app.llm.retry.time.sleep") as mock_sleep:
         with pytest.raises(ValueError, match="something else went wrong"):
             _call_with_failover(_raises_value_error)
 
@@ -207,7 +209,7 @@ def test_call_with_failover_uses_correct_exponential_backoff(monkeypatch):
     monkeypatch.delenv("API_KEY_2", raising=False)
     get_chat_model.cache_clear()
 
-    with patch("app.llm.client.time.sleep") as mock_sleep:
+    with patch("app.llm.retry.time.sleep") as mock_sleep:
         with pytest.raises(RateLimitExhaustedError):
             _call_with_failover(lambda _: (_ for _ in ()).throw(_make_rate_limit_error()))
 
@@ -240,7 +242,7 @@ def test_invoke_structured_surfaces_rate_limit_exhausted_not_structured_error(mo
         "Rate limited after multiple attempts — please try again in a few minutes."
     )
 
-    with patch("app.llm.client._call_with_failover", side_effect=exhausted):
+    with patch("app.llm.structured._call_with_failover", side_effect=exhausted):
         with pytest.raises(RateLimitExhaustedError) as exc_info:
             invoke_structured(UserRequirements, "describe my app")
 
@@ -266,7 +268,7 @@ def test_invoke_structured_does_not_retry_on_rate_limit_exhausted(monkeypatch):
         failover_call_count += 1
         raise exhausted
 
-    with patch("app.llm.client._call_with_failover", side_effect=_side_effect):
+    with patch("app.llm.structured._call_with_failover", side_effect=_side_effect):
         with pytest.raises(RateLimitExhaustedError):
             invoke_structured(UserRequirements, "describe my app")
 

@@ -10,7 +10,7 @@ blank extraction.
 from __future__ import annotations
 
 from app.agent.state import AgentState
-from app.llm.client import StructuredOutputError, invoke_structured
+from app.llm.structured import StructuredOutputError, invoke_structured
 from app.models.schemas import UserRequirements, WorkloadType
 
 

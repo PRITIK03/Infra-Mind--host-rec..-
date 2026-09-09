@@ -136,7 +136,7 @@ def _run_graph_with_streaming(
     job.retry_info without requiring any changes to node signatures.
     The context var is cleared after the pass completes.
     """
-    from app.llm.client import _retry_context
+    from app.llm.retry import _retry_context
 
     def _retry_cb(attempt: int, max_attempts: int) -> None:
         jobs.update_retry_info(

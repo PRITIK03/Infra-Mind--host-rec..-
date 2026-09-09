@@ -14,7 +14,7 @@ from app.agent.nodes._recommendation_utils import (
     invalid_instance_types as _invalid_instance_types,
 )
 from app.agent.state import AgentState
-from app.llm.client import StructuredOutputError, invoke_structured
+from app.llm.structured import StructuredOutputError, invoke_structured
 from app.models.schemas import InstanceRecommendation
 
 
