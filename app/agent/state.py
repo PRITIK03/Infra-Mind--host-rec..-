@@ -28,3 +28,4 @@ class AgentState(TypedDict):
     cache_candidates: list[CacheCandidate] | None
     recommendation: InstanceRecommendation | None
     system_design_recommendation: SystemDesignRecommendation | None
+    terraform_files: dict[str, str] | None

@@ -16,6 +16,7 @@ from app.agent.nodes.recommender import recommend_instance
 from app.agent.nodes.requirement_collector import collect_requirements
 from app.agent.nodes.requirement_validator import validate_requirements
 from app.agent.nodes.system_design_reasoner import reason_system_design
+from app.agent.nodes.terraform_generator import generate_terraform
 from app.agent.state import AgentState
 
 
@@ -33,6 +34,7 @@ def build_graph():
     graph.add_node("research_database", research_database)
     graph.add_node("research_cache", research_cache)
     graph.add_node("holistic_recommend", holistic_recommend)
+    graph.add_node("generate_terraform", generate_terraform)
 
     graph.set_entry_point("collect_requirements")
     graph.add_edge("collect_requirements", "validate_requirements")
@@ -47,7 +49,8 @@ def build_graph():
     graph.add_edge("research_instances", "research_database")
     graph.add_edge("research_database", "research_cache")
     graph.add_edge("research_cache", "holistic_recommend")
-    graph.add_edge("holistic_recommend", END)
+    graph.add_edge("holistic_recommend", "generate_terraform")
+    graph.add_edge("generate_terraform", END)
 
     return graph.compile()
 

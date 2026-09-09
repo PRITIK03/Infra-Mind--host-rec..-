@@ -3,11 +3,13 @@ CLI entrypoint for the AWS Instance Advisor agent.
 
 Collects requirements turn by turn (asking follow-up questions where
 needed), then reasons about system design, researches live EC2
-candidates, and prints a final recommendation.
+candidates, prints a final recommendation, and writes deployable
+Terraform files to ./terraform_output/.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 
 from app.agent.graph import build_graph
@@ -34,6 +36,7 @@ def main() -> None:
         "cache_candidates": None,
         "recommendation": None,
         "system_design_recommendation": None,
+        "terraform_files": None,
     }
 
     print("Describe your application and expected workload:")
@@ -132,6 +135,18 @@ def main() -> None:
             else:
                 print("  Needed: No")
                 print(f"  Why: {lb.why}")
+
+            # Terraform output
+            tf_files = state.get("terraform_files")
+            if tf_files:
+                out_dir = os.path.join(os.getcwd(), "terraform_output")
+                os.makedirs(out_dir, exist_ok=True)
+                print(f"\n--- Terraform Output ({out_dir}) ---")
+                for fname in sorted(tf_files):
+                    fpath = os.path.join(out_dir, fname)
+                    with open(fpath, "w", encoding="utf-8") as fh:
+                        fh.write(tf_files[fname])
+                    print(f"  Written: {fpath}")
 
             break
 
