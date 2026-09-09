@@ -426,3 +426,6 @@ def recommend_system_design(state: AgentState) -> AgentState:
 
     state["system_design_recommendation"] = result
     return state
+
+
+holistic_recommend = recommend_system_design

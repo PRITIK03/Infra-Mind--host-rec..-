@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.agent.graph import build_graph
+from app.agent.graph import build_v1_graph as build_graph
 from app.agent.nodes.recommender import RecommendationError, _PROMPT_TEMPLATE
 from app.agent.nodes.requirement_collector import collect_requirements
 from app.agent.nodes.requirement_validator import validate_requirements
