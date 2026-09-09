@@ -7,15 +7,35 @@ provider-agnostic structured extraction that does not depend on OpenAI's
 native json_schema structured-output API (unreliable on many OpenRouter
 / free models that return null `choices`).
 
-Supports optional dual-key rate-limit failover: if API_KEY_2 is
-configured the client will retry once using the secondary key when
-OpenAI returns a 429 RateLimitError.
+Rate-limit retry strategy
+--------------------------
+We set ``max_retries=0`` on ChatOpenAI to disable the OpenAI SDK's own
+internal retry loop entirely.  That loop uses tenacity/httpx-retry with
+exponential backoff *inside* the SDK, meaning it never surfaces a
+``RateLimitError`` to our code — it just sleeps, potentially for
+minutes, pinning the worker thread indefinitely under sustained 429s.
+
+Instead, ``_call_with_failover`` owns all retry logic with explicit
+hard bounds:
+
+  - Up to MAX_RATE_LIMIT_ATTEMPTS total attempts (primary and secondary
+    keys combined, interleaved so both keys get a chance on each round).
+  - Exponential backoff between attempts: BACKOFF_BASE_S * 2^attempt,
+    capped at BACKOFF_MAX_S.  This is wall-clock sleep that the caller
+    can reason about.
+  - After all attempts are exhausted, raises RateLimitExhaustedError
+    with a user-facing message suitable for surfacing in the API response.
+
+This means the TOTAL worst-case wall-clock time for one logical LLM call
+under sustained rate-limiting is bounded and predictable:
+  sum(min(BACKOFF_BASE_S * 2^i, BACKOFF_MAX_S) for i in range(attempts))
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
 from functools import lru_cache
 from typing import Any, Callable, TypeVar
 
@@ -27,9 +47,33 @@ from app.config import get_llm_settings
 
 T = TypeVar("T", bound=BaseModel)
 
+# ---------------------------------------------------------------------------
+# Rate-limit retry constants — all in one place for easy tuning.
+# ---------------------------------------------------------------------------
+
+# Total attempts across BOTH keys combined.  With 2 keys and 4 attempts,
+# each key gets at most 2 tries.  With 1 key, it gets all 4 tries.
+MAX_RATE_LIMIT_ATTEMPTS: int = 4
+
+# Initial sleep before the second attempt (doubles each round, capped below).
+BACKOFF_BASE_S: float = 2.0
+
+# Hard ceiling on any single inter-attempt sleep to avoid very long waits.
+BACKOFF_MAX_S: float = 16.0
+
 
 class StructuredOutputError(RuntimeError):
     """Raised when the LLM fails to produce valid structured output."""
+
+
+class RateLimitExhaustedError(RuntimeError):
+    """
+    Raised when all rate-limit retry attempts across all configured keys
+    are exhausted without a successful response.
+
+    The message is intentionally user-facing and safe to surface directly
+    in an API error response.
+    """
 
 
 def _reasoning_effort_for_budget(reasoning_max_tokens: int, max_tokens: int) -> str:
@@ -68,6 +112,13 @@ def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
     use_secondary:
         When True, build the client with `api_key_secondary`.  Raises
         RuntimeError if no secondary key is configured.
+
+    Notes
+    -----
+    ``max_retries=0`` disables the OpenAI SDK's internal retry loop.
+    All retry logic (with hard bounds and explicit backoff) is handled
+    by ``_call_with_failover`` so the SDK never silently sleeps and pins
+    a worker thread on sustained 429s.
     """
     settings = get_llm_settings()
     api_key = settings.api_key
@@ -88,7 +139,10 @@ def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
         model=settings.model_name,
         temperature=0,
         max_tokens=settings.max_tokens,
-        max_retries=3,
+        # 0 = disabled: we own all retry logic in _call_with_failover.
+        # The SDK's internal loop uses tenacity/httpx-retry and can sleep
+        # for minutes under sustained 429s without ever raising to our code.
+        max_retries=0,
         timeout=30,
         # Cap hidden reasoning so JSON output still has room. OpenRouter
         # rejects setting both effort and max_tokens; effort is used because
@@ -102,20 +156,44 @@ def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
 
 def _call_with_failover(fn: Callable[[ChatOpenAI], T]) -> T:
     """
-    Tries *fn* with the primary-key model first.  On
-    ``openai.RateLimitError`` specifically (not other exceptions),
-    retries **once** using the secondary-key model IF one is configured.
-    Any other exception, or exhausting both keys, propagates
-    immediately — errors are never swallowed.
+    Call *fn* with bounded retry and dual-key failover on RateLimitError.
+
+    Attempt schedule (MAX_RATE_LIMIT_ATTEMPTS=4, two keys configured):
+      attempt 0 — primary key   (no sleep before)
+      attempt 1 — secondary key (sleep BACKOFF_BASE_S * 2^0 = 2s)
+      attempt 2 — primary key   (sleep BACKOFF_BASE_S * 2^1 = 4s)
+      attempt 3 — secondary key (sleep BACKOFF_BASE_S * 2^2 = 8s)
+      → RateLimitExhaustedError
+
+    With only one key configured every attempt uses the primary key.
+
+    Non-RateLimitError exceptions propagate immediately without retrying —
+    errors are never swallowed.
     """
-    try:
-        return fn(get_chat_model(use_secondary=False))
-    except RateLimitError:
-        settings = get_llm_settings()
-        if not settings.api_key_secondary:
-            raise  # no secondary key configured — propagate the 429
-        print("[failover] Primary key rate-limited — retrying with secondary key …")
-        return fn(get_chat_model(use_secondary=True))
+    settings = get_llm_settings()
+    has_secondary = bool(settings.api_key_secondary)
+    last_exc: RateLimitError | None = None
+
+    for attempt in range(MAX_RATE_LIMIT_ATTEMPTS):
+        # Interleave keys: even attempts → primary, odd → secondary (if available).
+        use_secondary = has_secondary and (attempt % 2 == 1)
+        if attempt > 0:
+            sleep_s = min(BACKOFF_BASE_S * (2 ** (attempt - 1)), BACKOFF_MAX_S)
+            key_label = "secondary" if use_secondary else "primary"
+            print(
+                f"[rate-limit] attempt {attempt + 1}/{MAX_RATE_LIMIT_ATTEMPTS} "
+                f"(key={key_label}, backoff={sleep_s:.0f}s) …"
+            )
+            time.sleep(sleep_s)
+        try:
+            return fn(get_chat_model(use_secondary=use_secondary))
+        except RateLimitError as exc:
+            last_exc = exc
+            continue  # try next attempt
+
+    raise RateLimitExhaustedError(
+        "Rate limited after multiple attempts — please try again in a few minutes."
+    ) from last_exc
 
 
 def _message_text(response: object) -> str:
@@ -270,7 +348,7 @@ def invoke_structured(schema: type[T], prompt: str) -> T:
                 return _validate_structured_payload(schema, data)
 
             return _call_with_failover(_primary)
-        except RateLimitError:
+        except RateLimitExhaustedError:
             raise
         except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
             primary_error = exc
@@ -295,7 +373,7 @@ def invoke_structured(schema: type[T], prompt: str) -> T:
                 return schema.model_validate(normalized)
 
             return _call_with_failover(_fallback)
-        except RateLimitError:
+        except RateLimitExhaustedError:
             raise
         except StructuredOutputError:
             raise
@@ -308,13 +386,13 @@ def invoke_structured(schema: type[T], prompt: str) -> T:
 
     try:
         return _run_attempt(prompt)
-    except RateLimitError:
+    except RateLimitExhaustedError:
         raise
     except Exception:
         # One bounded retry of the entire primary+fallback unit — do not loop.
         try:
             return _run_attempt(f"{prompt}\n\n{_JSON_RETRY_NOTE}")
-        except RateLimitError:
+        except RateLimitExhaustedError:
             raise
         except StructuredOutputError:
             raise

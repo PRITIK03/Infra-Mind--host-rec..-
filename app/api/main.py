@@ -2,15 +2,43 @@
 FastAPI application exposing the LangGraph agent over HTTP.
 
 Agent invocations can take 2-3+ minutes under free-tier LLM load, so all
-work is dispatched to a background thread (asyncio.to_thread) and clients
-poll via GET /api/recommend/{job_id} for progress. The agent's
-multi-turn requirement-collection loop is surfaced via the
-awaiting_input status + POST /api/recommend/{job_id}/answer.
+work is dispatched to a background thread and clients poll via
+GET /api/recommend/{job_id} for progress. The agent's multi-turn
+requirement-collection loop is surfaced via the awaiting_input status +
+POST /api/recommend/{job_id}/answer.
+
+Thread-pool sizing
+------------------
+We use an explicit ThreadPoolExecutor rather than the default
+asyncio.to_thread executor (which uses ThreadPoolExecutor(max_workers=None),
+defaulting to min(32, os.cpu_count() + 4) — potentially 36 threads on a
+4-core box, or just the OS default on a constrained host).
+
+On a small Render/Railway/Fly instance (1–2 vCPUs, 512 MB – 1 GB RAM),
+each agent thread holds a live HTTP connection + LangGraph state + LLM
+response buffers. Running many concurrent threads on such a host causes
+memory pressure and scheduler thrashing before the concurrency limit
+matters. JOB_THREAD_POOL_SIZE=8 is deliberately conservative: it
+allows meaningful concurrency (8 simultaneous agent runs) while leaving
+headroom for the FastAPI worker, uvicorn I/O loop, and OS overhead.
+
+If a job hangs (even after the LLM-layer fixes), JOB_TIMEOUT_SECONDS
+ensures the slot is returned within a bounded time.  Adjust both
+constants via environment variables for larger hosts.
+
+Wall-clock job timeout
+----------------------
+Each background job is submitted via executor.submit() and tracked with
+Future.result(timeout=JOB_TIMEOUT_SECONDS).  A concurrent.futures.TimeoutError
+marks the job as "error" with a clear message — this is an independent
+safety net that fires regardless of what's happening inside the graph,
+protecting against any future hang scenario, not just rate-limit loops.
 """
 
 from __future__ import annotations
 
-import threading
+import concurrent.futures
+import os
 import time
 import uuid
 from typing import Any
@@ -24,6 +52,23 @@ from app.agent.state import AgentState
 from app.api.jobs import Job, JobStore, JobStatus, label_for_node
 from app.config import get_api_settings
 from app.models.schemas import SystemDesignRecommendation, UserRequirements
+
+# ---------------------------------------------------------------------------
+# Concurrency + timeout constants (overridable via env for larger hosts)
+# ---------------------------------------------------------------------------
+
+# Max simultaneous agent-run threads. Conservative for small cloud hosts
+# (Render free/starter, Railway, Fly.io shared-cpu-1x).
+JOB_THREAD_POOL_SIZE: int = int(os.getenv("JOB_THREAD_POOL_SIZE", "8"))
+
+# Hard wall-clock limit for a single complete agent run, in seconds.
+# A full run under free-tier rate limiting can legitimately take 3-4 min;
+# 10 min is generous enough for paid keys while bounding any true hang.
+JOB_TIMEOUT_SECONDS: float = float(os.getenv("JOB_TIMEOUT_SECONDS", "600"))
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
 
 
 class RecommendRequest(BaseModel):
@@ -47,6 +92,18 @@ app.add_middleware(
 )
 
 jobs = JobStore()
+
+# Single shared executor for all background agent runs.
+# Defined at module level so it is shared across requests and can be
+# cleanly shut down on process exit.
+_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=JOB_THREAD_POOL_SIZE,
+    thread_name_prefix="agent-job",
+)
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def _empty_state() -> AgentState:
@@ -100,6 +157,10 @@ def _graph_loop_sync(job_id: str, initial_state: AgentState) -> None:
     Runs passes of graph.stream(state) until either a final
     recommendation is produced or the agent asks a follow-up question.
     On any unhandled exception the job is marked errored.
+
+    This function is submitted to _executor and monitored by
+    _submit_with_timeout, which enforces JOB_TIMEOUT_SECONDS as an
+    independent wall-clock safety net.
     """
     state = initial_state
     try:
@@ -129,7 +190,7 @@ def _graph_loop_sync(job_id: str, initial_state: AgentState) -> None:
             )
             return
 
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:
         jobs.update_status(job_id, "error", error=f"{type(exc).__name__}: {exc}")
 
 
@@ -168,8 +229,46 @@ def _resume_with_answer_sync(job_id: str, answer: str) -> None:
             )
             return
 
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:
         jobs.update_status(job_id, "error", error=f"{type(exc).__name__}: {exc}")
+
+
+def _submit_with_timeout(fn, *args) -> None:
+    """
+    Submit *fn(*args)* to the shared executor and watch it with a
+    daemon thread that enforces JOB_TIMEOUT_SECONDS.
+
+    If the future does not complete in time, the job is marked as
+    "error" with a clear timeout message.  The underlying thread
+    continues running until it naturally exits (Python threads cannot
+    be forcibly killed), but the job slot is freed from the caller's
+    perspective and the executor queue is unblocked.
+
+    The job_id is always the first positional argument by convention.
+    """
+    job_id: str = args[0]
+    future = _executor.submit(fn, *args)
+
+    def _watchdog() -> None:
+        try:
+            future.result(timeout=JOB_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            jobs.update_status(
+                job_id,
+                "error",
+                error=(
+                    f"Job timed out after {JOB_TIMEOUT_SECONDS:.0f}s — "
+                    "the agent took too long to respond. Please try again."
+                ),
+            )
+        except Exception:
+            # The underlying fn already wrote its own error via jobs.update_status;
+            # nothing to do here — exceptions from the future are already handled
+            # inside _graph_loop_sync / _resume_with_answer_sync.
+            pass
+
+    import threading
+    threading.Thread(target=_watchdog, daemon=True, name=f"watchdog-{job_id}").start()
 
 
 def _serialize_result(state: AgentState) -> dict[str, Any]:
@@ -208,6 +307,11 @@ def _job_response(job: Job) -> dict[str, Any]:
     return resp
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     """Liveness probe. No LLM or live-data calls."""
@@ -228,13 +332,7 @@ def create_recommend_job(req: RecommendRequest) -> dict[str, Any]:
         state=state,
     )
     jobs.put(job)
-
-    thread = threading.Thread(
-        target=_graph_loop_sync,
-        args=(job_id, state),
-        daemon=True,
-    )
-    thread.start()
+    _submit_with_timeout(_graph_loop_sync, job_id, state)
 
     return {"job_id": job_id}
 
@@ -264,11 +362,6 @@ def answer_question(job_id: str, req: AnswerRequest) -> dict[str, Any]:
             detail=f"Job is not awaiting input (current status: {job.status})",
         )
 
-    thread = threading.Thread(
-        target=_resume_with_answer_sync,
-        args=(job_id, req.answer),
-        daemon=True,
-    )
-    thread.start()
+    _submit_with_timeout(_resume_with_answer_sync, job_id, req.answer)
 
     return {"job_id": job_id, "status": "running"}
