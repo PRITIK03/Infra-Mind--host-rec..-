@@ -293,6 +293,8 @@ def _serialize_result(state: AgentState) -> dict[str, Any]:
     rec = state.get("system_design_recommendation")
     v1_rec = state.get("recommendation")
     tf_files = state.get("terraform_files")
+    tn = state.get("technical_needs")
+    candidates = state.get("instance_candidates")
     result: dict[str, Any] = {}
     if rec is not None:
         if isinstance(rec, SystemDesignRecommendation):
@@ -306,6 +308,18 @@ def _serialize_result(state: AgentState) -> dict[str, Any]:
             result["recommendation"] = v1_rec
     if tf_files is not None:
         result["terraform_files"] = tf_files
+    # Include technical_needs and instance_candidates so the frontend can
+    # render ScalingRangeBar and CandidateLandscape from real data.
+    if tn is not None:
+        if hasattr(tn, "model_dump"):
+            result["technical_needs"] = tn.model_dump(mode="json")
+        else:
+            result["technical_needs"] = tn
+    if candidates:
+        result["instance_candidates"] = [
+            c.model_dump(mode="json") if hasattr(c, "model_dump") else c
+            for c in candidates
+        ]
     return result
 
 
@@ -336,6 +350,47 @@ def _job_response(job: Job) -> dict[str, Any]:
 def health() -> dict[str, Any]:
     """Liveness probe. No LLM or live-data calls."""
     return {"status": "ok", "time": time.time()}
+
+
+# Simple in-process cache so the landing page stat readout doesn't hammer
+# Vantage on every page load.  TTL of 10 minutes is generous — instance
+# counts don't change mid-session.
+_stats_cache: dict[str, Any] = {}
+_stats_cache_time: float = 0.0
+_STATS_TTL_S: float = 600.0
+
+
+@app.get("/api/stats")
+def get_stats() -> dict[str, Any]:
+    """
+    Returns live counts of tracked instance types.
+    Used by the landing page readout — cached for _STATS_TTL_S seconds.
+    """
+    global _stats_cache, _stats_cache_time
+    now = time.time()
+    if _stats_cache and (now - _stats_cache_time) < _STATS_TTL_S:
+        return _stats_cache
+
+    from app.tools.aws_instance_data import (
+        fetch_ec2_instance_data,
+        fetch_rds_instance_data,
+        fetch_cache_instance_data,
+        InstanceDataUnavailableError,
+    )
+    counts: dict[str, int] = {}
+    for key, fetcher in [
+        ("ec2", fetch_ec2_instance_data),
+        ("rds", fetch_rds_instance_data),
+        ("cache", fetch_cache_instance_data),
+    ]:
+        try:
+            counts[key] = len(fetcher())
+        except InstanceDataUnavailableError:
+            counts[key] = 0
+
+    _stats_cache = counts
+    _stats_cache_time = now
+    return counts
 
 
 @app.post("/api/recommend")
