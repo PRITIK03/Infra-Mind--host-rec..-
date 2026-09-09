@@ -37,7 +37,10 @@ def main() -> None:
     }
 
     print("Describe your application and expected workload:")
-    state["latest_user_message"] = input("> ")
+    try:
+        state["latest_user_message"] = input("> ")
+    except EOFError:
+        return
 
     while True:
         try:
@@ -154,7 +157,10 @@ def main() -> None:
 
         if state.get("next_question"):
             print(f"\n{state['next_question']}")
-            state["latest_user_message"] = input("> ")
+            try:
+                state["latest_user_message"] = input("> ")
+            except EOFError:
+                break
             continue
 
         print("\nNo recommendation or follow-up question was produced. Stopping.")
