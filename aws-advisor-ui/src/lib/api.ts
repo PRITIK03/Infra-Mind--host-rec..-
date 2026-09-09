@@ -52,3 +52,8 @@ export async function answerJob(
     body: JSON.stringify({ answer }),
   });
 }
+
+/** GET /api/stats — live instance type counts for landing page readout */
+export async function getStats(): Promise<{ ec2: number; rds: number; cache: number }> {
+  return request<{ ec2: number; rds: number; cache: number }>("/api/stats");
+}

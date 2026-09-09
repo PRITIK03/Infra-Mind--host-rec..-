@@ -7,6 +7,7 @@ import { AwaitingInputPanel } from "@/components/AwaitingInputPanel";
 import { ResultReport } from "@/components/ResultReport";
 import { TerraformViewer } from "@/components/TerraformViewer";
 import { ErrorPanel } from "@/components/ErrorPanel";
+import { LiveStatsReadout } from "@/components/LiveStatsReadout";
 
 // ── Example prompts drawn from the validated test scenarios ─────────────────
 const EXAMPLES = [
@@ -179,6 +180,8 @@ export default function Home() {
 
   const sdr = jobResponse?.result?.system_design_recommendation;
   const tfFiles = jobResponse?.result?.terraform_files;
+  const technicalNeeds = jobResponse?.result?.technical_needs;
+  const instanceCandidates = jobResponse?.result?.instance_candidates;
 
   return (
     <div className="min-h-dvh flex flex-col">
@@ -206,6 +209,9 @@ export default function Home() {
                 a vetted compute, database, cache, and load-balancer recommendation
                 — plus ready-to-apply Terraform.
               </p>
+              <div className="mt-4">
+                <LiveStatsReadout />
+              </div>
             </div>
             <InputPanel onSubmit={submit} disabled={isActive} />
           </section>
@@ -264,7 +270,7 @@ export default function Home() {
               </button>
             </div>
 
-            <ResultReport sdr={sdr} />
+            <ResultReport sdr={sdr} technicalNeeds={technicalNeeds} instanceCandidates={instanceCandidates} />
 
             {tfFiles && Object.keys(tfFiles).length > 0 && (
               <>

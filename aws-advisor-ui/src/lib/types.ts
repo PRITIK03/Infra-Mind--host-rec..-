@@ -60,6 +60,37 @@ export interface JobResult {
   /** Legacy V1 fallback — rendered if system_design_recommendation is absent */
   recommendation?: InstanceRecommendation;
   terraform_files?: Record<string, string>;
+  /** Live EC2 candidate pool used by the recommender — for CandidateLandscape */
+  instance_candidates?: InstanceCandidate[];
+  /** Derived technical needs — for ScalingRangeBar */
+  technical_needs?: TechnicalNeeds;
+}
+
+// ─── TechnicalNeeds (subset of fields the frontend needs) ─────────────────
+export interface TechnicalNeeds {
+  estimated_concurrency: number;
+  min_instances: number;
+  max_instances: number;
+  scaling_recommendation: string;
+  needs_database: boolean;
+  needs_cache: boolean;
+  load_balancer_needed: boolean;
+  resource_profile: string;
+  traffic_pattern: string;
+  requires_gpu: boolean;
+  reasoning: string;
+}
+
+// ─── InstanceCandidate ────────────────────────────────────────────────────
+export interface InstanceCandidate {
+  instance_type: string;
+  vcpu: number;
+  memory_gib: number;
+  gpu_count: number;
+  gpu_model?: string | null;
+  gpu_memory_gib?: number | null;
+  network_performance?: string | null;
+  hourly_price_usd?: number | null;
 }
 
 // ─── Polling response shapes ───────────────────────────────────────────────

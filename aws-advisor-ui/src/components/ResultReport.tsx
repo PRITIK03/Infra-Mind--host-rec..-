@@ -1,11 +1,17 @@
 "use client";
 
-import type { SystemDesignRecommendation } from "@/lib/types";
+import type { InstanceCandidate, SystemDesignRecommendation, TechnicalNeeds } from "@/lib/types";
 import { ArchSummary } from "./ArchSummary";
 import { ConfidenceDot } from "./ConfidenceDot";
+import { TopologyDiagram } from "./TopologyDiagram";
+import { CandidateLandscape } from "./CandidateLandscape";
+import { ScalingRangeBar } from "./ScalingRangeBar";
+import { ConfidenceStrip } from "./ConfidenceStrip";
 
 interface Props {
   sdr: SystemDesignRecommendation;
+  technicalNeeds?: TechnicalNeeds;
+  instanceCandidates?: InstanceCandidate[];
 }
 
 // ── Tiny helpers ────────────────────────────────────────────────────────────
@@ -68,8 +74,12 @@ function AssumptionsList({ items }: { items: string[] }) {
 
 function ComputeSection({
   compute,
+  technicalNeeds,
+  instanceCandidates,
 }: {
   compute: SystemDesignRecommendation["compute"];
+  technicalNeeds?: TechnicalNeeds;
+  instanceCandidates?: InstanceCandidate[];
 }) {
   return (
     <section>
@@ -98,6 +108,34 @@ function ComputeSection({
         )}
       </div>
       <AssumptionsList items={compute.assumptions} />
+
+      {/* ScalingRangeBar — only when technical_needs present */}
+      {technicalNeeds && (
+        <div className="mt-5">
+          <span className="font-mono text-xs text-ink-dim uppercase tracking-wider block mb-2">
+            scaling range
+          </span>
+          <ScalingRangeBar
+            minInstances={technicalNeeds.min_instances}
+            maxInstances={technicalNeeds.max_instances}
+            scalingRecommendation={technicalNeeds.scaling_recommendation}
+          />
+        </div>
+      )}
+
+      {/* CandidateLandscape — only when candidates present */}
+      {instanceCandidates && instanceCandidates.length > 0 && (
+        <div className="mt-5">
+          <span className="font-mono text-xs text-ink-dim uppercase tracking-wider block mb-2">
+            candidate landscape
+          </span>
+          <CandidateLandscape
+            candidates={instanceCandidates}
+            recommendedInstance={compute.recommended_instance}
+            alternativeInstance={compute.alternative_instance}
+          />
+        </div>
+      )}
     </section>
   );
 }
@@ -229,10 +267,24 @@ function LoadBalancerSection({
 
 // ── Main export ──────────────────────────────────────────────────────────────
 
-export function ResultReport({ sdr }: Props) {
+export function ResultReport({ sdr, technicalNeeds, instanceCandidates }: Props) {
   return (
     <div className="animate-fade-in space-y-0">
-      {/* ── Architecture summary — most prominent ── */}
+
+      {/* ── Topology diagram — first thing shown ── */}
+      <section className="py-6">
+        <div className="flex items-center gap-2 mb-4">
+          <span className="font-mono text-xs text-amber uppercase tracking-widest">
+            architecture topology
+          </span>
+          <span className="flex-1 border-t border-amber/20" />
+        </div>
+        <TopologyDiagram sdr={sdr} />
+      </section>
+
+      <hr className="console-rule" />
+
+      {/* ── Architecture summary ── */}
       <section className="py-6">
         <div className="flex items-center gap-2 mb-4">
           <span className="font-mono text-xs text-amber uppercase tracking-widest">
@@ -245,9 +297,26 @@ export function ResultReport({ sdr }: Props) {
 
       <hr className="console-rule" />
 
+      {/* ── Confidence strip — all needed tiers at a glance ── */}
+      <section className="py-6">
+        <div className="flex items-center gap-2 mb-4">
+          <span className="font-mono text-xs text-ink-muted uppercase tracking-widest">
+            confidence by tier
+          </span>
+          <span className="flex-1 border-t border-border-subtle" />
+        </div>
+        <ConfidenceStrip sdr={sdr} />
+      </section>
+
+      <hr className="console-rule" />
+
       {/* ── Tier sections ── */}
       <div className="py-6">
-        <ComputeSection compute={sdr.compute} />
+        <ComputeSection
+          compute={sdr.compute}
+          technicalNeeds={technicalNeeds}
+          instanceCandidates={instanceCandidates}
+        />
       </div>
 
       <hr className="console-rule" />
