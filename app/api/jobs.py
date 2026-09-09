@@ -42,6 +42,10 @@ class Job:
     next_question: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    # Set while the LLM layer is retrying after a rate-limit response,
+    # e.g. "Retrying after rate limit (attempt 2 of 4)".  Cleared back
+    # to None when the retry succeeds so the UI can stop showing it.
+    retry_info: str | None = None
     created_at: float = field(default_factory=lambda: __import__("time").time())
 
 
@@ -94,6 +98,18 @@ class JobStore:
                 job.state = state
                 if state.get("next_question"):
                     job.next_question = state["next_question"]
+
+    def update_retry_info(self, job_id: str, retry_info: str | None) -> None:
+        """Set or clear the real-time retry progress message.
+
+        Pass a non-None string while a rate-limit retry is in progress
+        (e.g. "Retrying after rate limit (attempt 2 of 4)").
+        Pass None to clear it once the retry succeeds.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.retry_info = retry_info
 
 
 STAGE_LABELS: dict[str, str] = {

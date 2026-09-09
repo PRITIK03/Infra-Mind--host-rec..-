@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, Callable, TypeVar
 
@@ -60,6 +61,19 @@ BACKOFF_BASE_S: float = 2.0
 
 # Hard ceiling on any single inter-attempt sleep to avoid very long waits.
 BACKOFF_MAX_S: float = 16.0
+
+# ---------------------------------------------------------------------------
+# Thread-local retry context
+# ---------------------------------------------------------------------------
+
+# A ContextVar holding an optional callback (attempt, max_attempts) -> None.
+# Set by api/main.py's _run_graph_with_streaming for the duration of a graph
+# pass so that every invoke_structured call in that thread automatically
+# updates job.retry_info without needing changes to node function signatures.
+# Defaults to None (no-op) — safe to call from CLI or tests without any setup.
+_retry_context: ContextVar[Callable[[int, int], None] | None] = ContextVar(
+    "_retry_context", default=None
+)
 
 
 class StructuredOutputError(RuntimeError):
@@ -119,6 +133,14 @@ def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
     All retry logic (with hard bounds and explicit backoff) is handled
     by ``_call_with_failover`` so the SDK never silently sleeps and pins
     a worker thread on sustained 429s.
+
+    ``extra_body["models"]`` is populated when LLM_FALLBACK_MODELS is
+    configured.  This passes OpenRouter's server-side model fallback
+    array, which reroutes a request to the next model in the list when
+    the primary is rate-limited or unavailable — a different mechanism
+    from the dual-key failover (which handles per-account 429s).  The
+    two are additive: keys handle account quotas, this handles per-model
+    congestion.
     """
     settings = get_llm_settings()
     api_key = settings.api_key
@@ -133,6 +155,16 @@ def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
     effort = _reasoning_effort_for_budget(
         settings.reasoning_max_tokens, settings.max_tokens
     )
+
+    extra: dict[str, Any] = {"reasoning": {"effort": effort}}
+
+    # OpenRouter server-side model fallback: if the primary model is
+    # rate-limited or unavailable, OpenRouter tries each model in order.
+    # Only added when LLM_FALLBACK_MODELS is configured — zero change to
+    # request payload when the list is empty (backward compatible).
+    if settings.fallback_models:
+        extra["models"] = [settings.model_name, *settings.fallback_models]
+
     return ChatOpenAI(
         api_key=api_key,
         base_url=settings.base_url,
@@ -144,17 +176,15 @@ def get_chat_model(use_secondary: bool = False) -> ChatOpenAI:
         # for minutes under sustained 429s without ever raising to our code.
         max_retries=0,
         timeout=30,
-        # Cap hidden reasoning so JSON output still has room. OpenRouter
-        # rejects setting both effort and max_tokens; effort is used because
-        # reasoning.max_tokens is ignored by some free-router models.
-        # Assumption: OpenAI-compatible endpoints ignore unrecognized body
-        # fields rather than erroring — revisit if switching away from
-        # OpenRouter to a provider that rejects unknown keys.
-        extra_body={"reasoning": {"effort": effort}},
+        extra_body=extra,
     )
 
 
-def _call_with_failover(fn: Callable[[ChatOpenAI], T]) -> T:
+def _call_with_failover(
+    fn: Callable[[ChatOpenAI], T],
+    *,
+    retry_callback: Callable[[int, int], None] | None = None,
+) -> T:
     """
     Call *fn* with bounded retry and dual-key failover on RateLimitError.
 
@@ -169,10 +199,24 @@ def _call_with_failover(fn: Callable[[ChatOpenAI], T]) -> T:
 
     Non-RateLimitError exceptions propagate immediately without retrying —
     errors are never swallowed.
+
+    Parameters
+    ----------
+    fn:
+        Callable that receives a ChatOpenAI model and returns a result.
+    retry_callback:
+        Optional explicit callback invoked at the start of each retry
+        attempt (attempt > 0) with (current_attempt, max_attempts).
+        If None, falls back to the thread-local _retry_context value so
+        callers don't need to thread the callback manually — it's set
+        once per graph pass by api/main.py.
     """
     settings = get_llm_settings()
     has_secondary = bool(settings.api_key_secondary)
     last_exc: RateLimitError | None = None
+
+    # Resolve callback: explicit arg wins; fall back to context var.
+    cb = retry_callback if retry_callback is not None else _retry_context.get()
 
     for attempt in range(MAX_RATE_LIMIT_ATTEMPTS):
         # Interleave keys: even attempts → primary, odd → secondary (if available).
@@ -184,6 +228,8 @@ def _call_with_failover(fn: Callable[[ChatOpenAI], T]) -> T:
                 f"[rate-limit] attempt {attempt + 1}/{MAX_RATE_LIMIT_ATTEMPTS} "
                 f"(key={key_label}, backoff={sleep_s:.0f}s) …"
             )
+            if cb is not None:
+                cb(attempt + 1, MAX_RATE_LIMIT_ATTEMPTS)
             time.sleep(sleep_s)
         try:
             return fn(get_chat_model(use_secondary=use_secondary))
@@ -306,25 +352,27 @@ _JSON_RETRY_NOTE = (
 )
 
 
-def invoke_structured(schema: type[T], prompt: str) -> T:
+def invoke_structured(
+    schema: type[T],
+    prompt: str,
+    *,
+    retry_callback: Callable[[int, int], None] | None = None,
+) -> T:
     """
     Provider-agnostic structured extraction into a Pydantic schema.
 
     Primary path: plain chat completion + JSON object + Pydantic validation.
-    This avoids OpenAI `json_schema` structured-output / tool-call APIs that
-    many OpenAI-compatible providers (including OpenRouter free models) handle
-    poorly, often returning `choices=None` and crashing LangChain parsers.
+    Secondary path: LangChain ``with_structured_output(..., method="json_mode")``
+    if the primary path fails.
 
-    Secondary path: LangChain `with_structured_output(..., method="json_mode")`
-    if the primary path fails — still validated as the schema type when possible.
+    The primary + fallback pair is treated as one attempt and retried
+    exactly once on parse/validation failure.  Rate-limit errors
+    propagate immediately after failover exhaustion.
 
-    The primary + fallback pair is treated as one attempt. If that whole
-    attempt fails for any reason (empty/non-JSON content, missing fields,
-    provider parse errors, etc.), it is retried exactly once with a corrective
-    instruction. Rate-limit errors still propagate immediately after failover.
-
-    Both paths are routed through _call_with_failover() for automatic
-    rate-limit failover when a secondary API key is configured.
+    Both paths call ``_call_with_failover``, which reads the thread-local
+    ``_retry_context`` ContextVar automatically — no explicit wiring
+    needed from callers.  The optional ``retry_callback`` kwarg overrides
+    the context var and is mainly useful in tests.
     """
     schema_name = schema.__name__
     schema_json = json.dumps(schema.model_json_schema(), indent=2)
@@ -347,7 +395,7 @@ def invoke_structured(schema: type[T], prompt: str) -> T:
                 data = _parse_json_object(text)
                 return _validate_structured_payload(schema, data)
 
-            return _call_with_failover(_primary)
+            return _call_with_failover(_primary, retry_callback=retry_callback)
         except RateLimitExhaustedError:
             raise
         except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -372,7 +420,7 @@ def invoke_structured(schema: type[T], prompt: str) -> T:
                 normalized = _normalize_instance_recommendation_payload(schema, result)
                 return schema.model_validate(normalized)
 
-            return _call_with_failover(_fallback)
+            return _call_with_failover(_fallback, retry_callback=retry_callback)
         except RateLimitExhaustedError:
             raise
         except StructuredOutputError:

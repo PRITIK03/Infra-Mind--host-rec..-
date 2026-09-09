@@ -131,20 +131,38 @@ def _run_graph_with_streaming(
     Run one graph pass using .stream() so we surface per-node stage
     labels to the job. Returns the final state after the full pass.
 
-    *collecting* marks whether this pass is part of the initial
-    requirement-collection phase — used so we can report
-    "collecting" / "awaiting_input" statuses distinct from the
-    downstream "running" research/recommendation phase.
+    Sets the thread-local retry context var so that invoke_structured
+    calls made from any node in this pass automatically update
+    job.retry_info without requiring any changes to node signatures.
+    The context var is cleared after the pass completes.
     """
-    graph = build_graph()
-    final_state: AgentState = state
+    from app.llm.client import _retry_context
 
-    for chunk in graph.stream(state):
-        node_name = next(iter(chunk.keys()))
-        stage_label = label_for_node(node_name)
-        jobs.update_stage(job_id, stage_label)
-        final_state = chunk[node_name]
-        jobs.update_state(job_id, final_state)
+    def _retry_cb(attempt: int, max_attempts: int) -> None:
+        jobs.update_retry_info(
+            job_id,
+            f"Retrying after rate limit (attempt {attempt} of {max_attempts})",
+        )
+
+    def _clear_retry_cb(attempt: int, max_attempts: int) -> None:  # noqa: ARG001
+        # Sentinel: called with attempt=0 to signal "clear".
+        jobs.update_retry_info(job_id, None)
+
+    token = _retry_context.set(_retry_cb)
+    try:
+        graph = build_graph()
+        final_state: AgentState = state
+
+        for chunk in graph.stream(state):
+            node_name = next(iter(chunk.keys()))
+            stage_label = label_for_node(node_name)
+            jobs.update_stage(job_id, stage_label)
+            final_state = chunk[node_name]
+            jobs.update_state(job_id, final_state)
+            # Clear retry_info after each node completes successfully.
+            jobs.update_retry_info(job_id, None)
+    finally:
+        _retry_context.reset(token)
 
     return final_state
 
@@ -298,6 +316,8 @@ def _job_response(job: Job) -> dict[str, Any]:
         "current_stage": job.current_stage,
         "created_at": job.created_at,
     }
+    if job.retry_info is not None:
+        resp["retry_info"] = job.retry_info
     if job.status == "awaiting_input" and job.next_question is not None:
         resp["next_question"] = job.next_question
     if job.status == "done" and job.result is not None:

@@ -51,6 +51,12 @@ class LLMSettings:
     # max_tokens so visible JSON output still has room.
     reasoning_max_tokens: int = 2048
     api_key_secondary: str | None = None
+    # Optional server-side model fallback list for OpenRouter.  When set,
+    # OpenRouter will automatically reroute to the next model in the list if
+    # the primary is rate-limited or unavailable — distinct from the
+    # dual-key failover which handles per-account 429s.  Read as a
+    # comma-separated string from LLM_FALLBACK_MODELS; defaults to empty.
+    fallback_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -69,6 +75,10 @@ class TavilySettings:
 
 def get_llm_settings() -> LLMSettings:
     """Loads and validates LLM-related settings only."""
+    raw_fallback = os.getenv("LLM_FALLBACK_MODELS", "")
+    fallback_models: tuple[str, ...] = tuple(
+        m.strip() for m in raw_fallback.split(",") if m.strip()
+    )
     return LLMSettings(
         api_key=_require("API_KEY"),
         base_url=_require("BASE_URL"),
@@ -76,6 +86,7 @@ def get_llm_settings() -> LLMSettings:
         max_tokens=_optional_int("LLM_MAX_TOKENS", 8192),
         reasoning_max_tokens=_optional_int("LLM_REASONING_MAX_TOKENS", 2048),
         api_key_secondary=os.getenv("API_KEY_2") or None,
+        fallback_models=fallback_models,
     )
 
 
