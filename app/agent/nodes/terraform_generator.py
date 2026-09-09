@@ -83,6 +83,18 @@ RDS_ENGINE_MAP: dict[str, str] = {
     "mariadb": "mariadb",
 }
 
+RDS_ENGINE_PORT_MAP: dict[str, int] = {
+    "postgres": 5432,
+    "mysql": 3306,
+    "mariadb": 3306,
+}
+
+CACHE_ENGINE_PORT_MAP: dict[CacheEngine, int] = {
+    CacheEngine.REDIS: 6379,
+    CacheEngine.VALKEY: 6379,
+    CacheEngine.MEMCACHED: 11211,
+}
+
 
 def _rds_engine(engine_suggestion: str | None) -> str:
     if engine_suggestion is None:
@@ -157,6 +169,16 @@ data "aws_subnets" "default" {{
     values = [data.aws_vpc.default.id]
   }}
 }}
+
+data "aws_ami" "app" {{
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {{
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }}
+}}
 """
 
 
@@ -186,9 +208,8 @@ variable "db_username" {
 }
 
 variable "db_password" {
-  description = "RDS master password — REPLACE WITH SECRET before apply; do not commit this value."
+  description = "RDS master password — supply via TF_VAR_db_password or -var; do not commit this value."
   type        = string
-  default     = "changeme-please-replace-before-apply"
   sensitive   = true
 }
 """
@@ -353,7 +374,7 @@ def _launch_template_asg(
     return f"""\
 resource "aws_launch_template" "app" {{
   name_prefix = "${{var.app_name}}-lt-"
-  image_id = "ami-0c101f26f44444444"
+  image_id = data.aws_ami.app.id
   instance_type = "{compute_instance}"
 
   vpc_security_group_ids = [aws_security_group.compute.id]
@@ -590,12 +611,14 @@ def _build_main(
     parts.append("")
 
     if sdr.database.needed:
-        parts.append(_sg_db_from_compute(RDS_PORT))
+        db_engine = _rds_engine(sdr.database.engine_suggestion)
+        db_port = RDS_ENGINE_PORT_MAP.get(db_engine, RDS_PORT)
+        parts.append(_sg_db_from_compute(db_port))
         parts.append("")
 
     if sdr.cache.needed and sdr.cache.engine:
-        cache_info = CACHE_ENGINE_RESOURCE_MAP[sdr.cache.engine]
-        parts.append(_sg_cache_from_compute(cache_info["port"]))
+        cache_port = CACHE_ENGINE_PORT_MAP[sdr.cache.engine]
+        parts.append(_sg_cache_from_compute(cache_port))
         parts.append("")
 
     # Launch template + ASG

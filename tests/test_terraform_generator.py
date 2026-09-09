@@ -435,3 +435,135 @@ def test_missing_state_raises():
     no_sdr = {"system_design_recommendation": None, "technical_needs": tn}
     with pytest.raises(RuntimeError, match="must be present"):
         generate_terraform(no_sdr)
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression: RDS engine-to-port mapping
+# ---------------------------------------------------------------------------
+
+def test_mysql_db_security_group_uses_port_3306_not_5432():
+    """
+    A MySQL recommendation must produce a db security group that opens port
+    3306, NOT the old hardcoded 5432 (postgres default).
+    Bug-fix regression for RDS_ENGINE_PORT_MAP introduction.
+    """
+    sdr, tn = _scenario2()          # scenario2 uses MySQL
+    out = generate_terraform(_state_with(sdr, tn))
+    main = out["terraform_files"]["main.tf"]
+
+    # DB SG must allow 3306
+    assert "from_port       = 3306" in main, (
+        "MySQL DB security group should open port 3306, not 5432"
+    )
+    assert "to_port         = 3306" in main, (
+        "MySQL DB security group should open port 3306, not 5432"
+    )
+
+    # Must NOT contain 5432 anywhere in the db SG block
+    # (postgres port must be absent from a MySQL deployment)
+    assert "from_port       = 5432" not in main, (
+        "MySQL DB security group must NOT open port 5432 (that is the Postgres port)"
+    )
+
+
+def test_postgres_db_security_group_uses_port_5432():
+    """
+    A PostgreSQL recommendation must still produce a db security group that
+    opens port 5432.
+    """
+    sdr, tn = _scenario1()          # scenario1 uses PostgreSQL
+    out = generate_terraform(_state_with(sdr, tn))
+    main = out["terraform_files"]["main.tf"]
+
+    assert "from_port       = 5432" in main
+    assert "to_port         = 5432" in main
+    assert "from_port       = 3306" not in main
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression: cache engine-to-port mapping
+# ---------------------------------------------------------------------------
+
+def _memcached_scenario() -> tuple[SystemDesignRecommendation, TechnicalNeeds]:
+    """Minimal scenario with Memcached cache so we can assert port 11211."""
+    sdr = SystemDesignRecommendation(
+        compute=InstanceRecommendation(
+            recommended_instance="m5.large",
+            why="General compute",
+            assumptions=[],
+            confidence="medium",
+        ),
+        database=DatabaseRecommendation(
+            needed=True,
+            recommended_instance="db.t3.medium",
+            engine_suggestion="PostgreSQL",
+            why="Standard relational store",
+            assumptions=[],
+            confidence="medium",
+        ),
+        cache=CacheRecommendation(
+            needed=True,
+            recommended_instance="cache.m5.large",
+            engine=CacheEngine.MEMCACHED,
+            why="Simple session cache with Memcached",
+            assumptions=[],
+            confidence="medium",
+        ),
+        load_balancer=LoadBalancerRecommendation(
+            needed=False,
+            why="No LB needed for this test scenario.",
+        ),
+        architecture_summary="Single instance + Postgres + Memcached session cache.",
+    )
+    tn = _base_needs(
+        estimated_concurrency=50,
+        needs_database=True,
+        needs_cache=True,
+        min_instances=1,
+        max_instances=1,
+        load_balancer_needed=False,
+        reasoning="memcached port test",
+    )
+    return sdr, tn
+
+
+def test_memcached_cache_security_group_uses_port_11211_not_6379():
+    """
+    A Memcached recommendation must produce a cache security group that opens
+    port 11211, NOT the old hardcoded 6379 (Redis/Valkey default).
+    Bug-fix regression for CACHE_ENGINE_PORT_MAP introduction.
+    """
+    sdr, tn = _memcached_scenario()
+    out = generate_terraform(_state_with(sdr, tn))
+    main = out["terraform_files"]["main.tf"]
+
+    # Cache SG must allow 11211
+    assert "from_port       = 11211" in main, (
+        "Memcached cache security group should open port 11211, not 6379"
+    )
+    assert "to_port         = 11211" in main, (
+        "Memcached cache security group should open port 11211, not 6379"
+    )
+
+    # Redis port must be absent
+    assert "from_port       = 6379" not in main, (
+        "Memcached cache security group must NOT open port 6379 (that is the Redis/Valkey port)"
+    )
+
+    # Also confirm the resource type is aws_elasticache_cluster (not replication_group)
+    assert "aws_elasticache_cluster" in main
+    assert "aws_elasticache_replication_group" not in main
+
+
+def test_redis_cache_security_group_uses_port_6379():
+    """
+    A Redis recommendation must still produce a cache security group that opens
+    port 6379.
+    """
+    sdr, tn = _scenario1()          # scenario1 uses Redis
+    out = generate_terraform(_state_with(sdr, tn))
+    main = out["terraform_files"]["main.tf"]
+
+    assert "from_port       = 6379" in main
+    assert "to_port         = 6379" in main
+    assert "from_port       = 11211" not in main

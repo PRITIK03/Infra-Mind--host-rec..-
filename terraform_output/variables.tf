@@ -23,8 +23,7 @@ variable "db_username" {
 }
 
 variable "db_password" {
-  description = "RDS master password — REPLACE WITH SECRET before apply; do not commit this value."
+  description = "RDS master password — supply via TF_VAR_db_password or -var; do not commit this value."
   type        = string
-  default     = "changeme-please-replace-before-apply"
   sensitive   = true
 }

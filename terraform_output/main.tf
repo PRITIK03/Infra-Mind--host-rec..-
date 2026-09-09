@@ -9,9 +9,9 @@
  *
  *  YOU MUST REVIEW THE FOLLOWING BEFORE `terraform apply`:
  *
- *    - SECURITY: Security groups are deliberately minimal â€”
+ *    - SECURITY: Security groups are deliberately minimal —
  *      they are a baseline and should be tightened. Database credentials
- *      use a placeholder password below â€” replace with a secret
+ *      use a placeholder password below — replace with a secret
  *      manager or rotate to real values.
  *
  *    - COST: Instance sizes were chosen for the described workload.
@@ -54,6 +54,16 @@ data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
+  }
+}
+
+data "aws_ami" "app" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
   }
 }
 
@@ -167,7 +177,7 @@ resource "aws_security_group" "cache" {
 
 resource "aws_launch_template" "app" {
   name_prefix = "${var.app_name}-lt-"
-  image_id = "ami-0c101f26f44444444"
+  image_id = data.aws_ami.app.id
   instance_type = "m5.xlarge"
 
   vpc_security_group_ids = [aws_security_group.compute.id]
