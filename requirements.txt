@@ -8,3 +8,5 @@ python-dotenv
 httpx
 pytest
 instances-api-client
+fastapi
+uvicorn

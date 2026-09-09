@@ -91,3 +91,19 @@ def get_tavily_settings() -> TavilySettings:
     return TavilySettings(
         api_key=_require("TAVILY_API_KEY"),
     )
+
+
+@dataclass(frozen=True)
+class APISettings:
+    """Config for the FastAPI HTTP layer exposing the agent."""
+
+    cors_allowed_origin: str
+    port: int = 8000
+
+
+def get_api_settings() -> APISettings:
+    """Loads and validates API-related settings only."""
+    return APISettings(
+        cors_allowed_origin=_require("CORS_ALLOWED_ORIGIN"),
+        port=_optional_int("PORT", 8000),
+    )
