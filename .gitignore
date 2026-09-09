@@ -37,3 +37,8 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Next.js UI (aws-advisor-ui)
+aws-advisor-ui/node_modules/
+aws-advisor-ui/.next/
+aws-advisor-ui/.env*.local
