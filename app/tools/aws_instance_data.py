@@ -17,14 +17,6 @@ from typing import Any
 
 import httpx
 
-try:
-    from instances_api_client.client import GLOBAL_SERVICES_JSON_URLS, USER_AGENT
-except ImportError:
-    USER_AGENT = "instances-api-client-python"
-    GLOBAL_SERVICES_JSON_URLS = {
-        "ec2": "https://instances.vantage.sh/instances.json",
-    }
-
 from app.config import ConfigError, get_vantage_settings
 from app.models.schemas import CacheCandidate, CacheEngine, DatabaseCandidate, InstanceCandidate
 
@@ -52,12 +44,46 @@ def _is_retryable_exception(exc: Exception) -> bool:
     return False
 
 
+def _get_service_urls() -> dict[str, str]:
+    """
+    Return the service → JSON URL mapping from instances_api_client.
+
+    Resolved lazily (called at fetch time, not at module import time) so
+    that instances_api_client.client is always fully initialised before we
+    read from it.  A module-level try/except import was the root cause of a
+    production bug: if instances_api_client.client was mid-initialisation
+    when aws_instance_data first loaded (import-order race during uvicorn
+    startup), the ImportError fallback fired and bound a dict that only
+    contained 'ec2', silently dropping rds/cache URLs for the rest of the
+    process lifetime.
+    """
+    try:
+        from instances_api_client.client import GLOBAL_SERVICES_JSON_URLS
+        return dict(GLOBAL_SERVICES_JSON_URLS)
+    except (ImportError, AttributeError):
+        # Hard fallback — only used if the package is genuinely absent.
+        # Raises clearly rather than silently dropping service URLs.
+        return {
+            "ec2": "https://instances.vantage.sh/instances.json",
+            "rds": "https://instances.vantage.sh/rds/instances.json",
+            "cache": "https://instances.vantage.sh/cache/instances.json",
+        }
+
+
+def _get_user_agent() -> str:
+    try:
+        from instances_api_client.client import USER_AGENT
+        return USER_AGENT
+    except (ImportError, AttributeError):
+        return "instances-api-client-python"
+
+
 def _auth_headers() -> dict[str, str]:
     try:
         settings = get_vantage_settings()
     except ConfigError as exc:
         raise InstanceDataUnavailableError(str(exc)) from exc
-    return {"User-Agent": USER_AGENT, "Authorization": f"Bearer {settings.api_key}"}
+    return {"User-Agent": _get_user_agent(), "Authorization": f"Bearer {settings.api_key}"}
 
 
 def _get_json(url: str, max_attempts: int = 3, backoff_base: float = 1.0) -> Any:
@@ -130,7 +156,7 @@ def _item_to_candidate(item: dict[str, Any]) -> InstanceCandidate | None:
 
 def fetch_ec2_instance_data() -> list[InstanceCandidate]:
     """Fetches the full current list of EC2 instance types. No caching yet by design."""
-    url = GLOBAL_SERVICES_JSON_URLS.get("ec2")
+    url = _get_service_urls().get("ec2")
     if not url:
         raise InstanceDataUnavailableError(
             "EC2 instances URL is not configured in the live data client."
@@ -147,7 +173,7 @@ def fetch_ec2_instance_data() -> list[InstanceCandidate]:
 
 def fetch_rds_instance_data() -> list[DatabaseCandidate]:
     """Fetches the current list of RDS database instance classes."""
-    url = GLOBAL_SERVICES_JSON_URLS.get("rds")
+    url = _get_service_urls().get("rds")
     if not url:
         raise InstanceDataUnavailableError(
             "RDS instances URL is not configured in the live data client."
@@ -192,7 +218,7 @@ def fetch_rds_instance_data() -> list[DatabaseCandidate]:
 
 def fetch_cache_instance_data() -> list[CacheCandidate]:
     """Fetches ElastiCache node types — one entry per node-type/engine combination."""
-    url = GLOBAL_SERVICES_JSON_URLS.get("cache")
+    url = _get_service_urls().get("cache")
     if not url:
         raise InstanceDataUnavailableError(
             "ElastiCache instances URL is not configured in the live data client."
