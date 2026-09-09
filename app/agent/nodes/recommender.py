@@ -9,6 +9,10 @@ confidence, and an alternative.
 
 from __future__ import annotations
 
+from app.agent.nodes._recommendation_utils import (
+    correction_prompt as _correction_prompt,
+    invalid_instance_types as _invalid_instance_types,
+)
 from app.agent.state import AgentState
 from app.llm.client import StructuredOutputError, invoke_structured
 from app.models.schemas import InstanceRecommendation
@@ -94,37 +98,6 @@ Output contract (very important):
 - Do not add extra top-level keys.
 - Do not return anything except the single JSON object.
 """
-
-
-def _invalid_instance_types(
-    result: InstanceRecommendation, allowed: set[str]
-) -> list[str]:
-    """Return invented instance types from the recommendation (if any)."""
-    invalid: list[str] = []
-    if result.recommended_instance not in allowed:
-        invalid.append(result.recommended_instance)
-    if (
-        result.alternative_instance is not None
-        and result.alternative_instance not in allowed
-    ):
-        invalid.append(result.alternative_instance)
-    return invalid
-
-
-def _correction_prompt(
-    base_prompt: str,
-    *,
-    invalid_instances: list[str],
-    allowed_types: list[str],
-) -> str:
-    invalid_joined = ", ".join(repr(t) for t in invalid_instances)
-    allowed_joined = ", ".join(allowed_types)
-    return (
-        f"{base_prompt}\n\n"
-        f"Your previous answer suggested {invalid_joined}, which is not one "
-        f"of the available options. You MUST choose recommended_instance and "
-        f"alternative_instance only from this exact list: {allowed_joined}."
-    )
 
 
 def recommend_instance(state: AgentState) -> AgentState:

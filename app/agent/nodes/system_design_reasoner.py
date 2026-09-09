@@ -85,6 +85,20 @@ resource profile. If optional research findings are provided below,
 use only what is directly relevant; do not let generic marketing
 content override the user's concrete numbers.
 
+Also determine: needs_database (does this workload need a persistent
+relational database — most web apps and API services do, default to
+true unless the workload is clearly stateless or explicitly uses
+another storage approach), needs_cache (would a caching layer
+meaningfully help — this should NOT default to true; only recommend
+it when there is a clear read-heavy or repeated-access pattern, do
+not add it reflexively), and min_instances/max_instances (concrete
+numbers for the compute tier, consistent with your
+scaling_recommendation and estimated_concurrency — if
+scaling_recommendation is vertical/single-instance, min_instances
+should equal max_instances; if horizontal, max_instances should
+exceed min_instances to reflect real elasticity). Set
+load_balancer_needed to true whenever max_instances > 1.
+
 Output contract (very important):
 - Return EXACTLY one JSON object.
 - The top-level JSON object MUST match the TechnicalNeeds schema directly.

@@ -26,7 +26,7 @@ except ImportError:
     }
 
 from app.config import ConfigError, get_vantage_settings
-from app.models.schemas import InstanceCandidate
+from app.models.schemas import CacheCandidate, CacheEngine, DatabaseCandidate, InstanceCandidate
 
 
 class InstanceDataUnavailableError(RuntimeError):
@@ -142,4 +142,102 @@ def fetch_ec2_instance_data() -> list[InstanceCandidate]:
     candidates = [c for c in (_item_to_candidate(i) for i in items if isinstance(i, dict)) if c]
     if not candidates:
         raise InstanceDataUnavailableError("Live EC2 instance data source returned no results.")
+    return candidates
+
+
+def fetch_rds_instance_data() -> list[DatabaseCandidate]:
+    """Fetches the current list of RDS database instance classes."""
+    url = GLOBAL_SERVICES_JSON_URLS.get("rds")
+    if not url:
+        raise InstanceDataUnavailableError(
+            "RDS instances URL is not configured in the live data client."
+        )
+    items = _get_json(url)
+    if not isinstance(items, list):
+        raise InstanceDataUnavailableError("Unexpected RDS instances JSON structure.")
+
+    candidates: list[DatabaseCandidate] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        instance_type = item.get("instance_type") or item.get("instanceType")
+        if not instance_type:
+            continue
+        try:
+            vcpu = int(item.get("vcpu", 0))
+        except (TypeError, ValueError):
+            vcpu = 0
+        try:
+            memory_gib = float(item.get("memory", 0))
+        except (TypeError, ValueError):
+            memory_gib = 0.0
+        candidates.append(
+            DatabaseCandidate(
+                instance_type=instance_type,
+                family=item.get("family", "unknown"),
+                vcpu=vcpu,
+                memory_gib=memory_gib,
+                network_performance=(
+                    item.get("network_performance")
+                    or item.get("networkPerformance")
+                    or "unknown"
+                ),
+            )
+        )
+
+    if not candidates:
+        raise InstanceDataUnavailableError("Live RDS instance data source returned no results.")
+    return candidates
+
+
+def fetch_cache_instance_data() -> list[CacheCandidate]:
+    """Fetches ElastiCache node types — one entry per node-type/engine combination."""
+    url = GLOBAL_SERVICES_JSON_URLS.get("cache")
+    if not url:
+        raise InstanceDataUnavailableError(
+            "ElastiCache instances URL is not configured in the live data client."
+        )
+    items = _get_json(url)
+    if not isinstance(items, list):
+        raise InstanceDataUnavailableError("Unexpected ElastiCache instances JSON structure.")
+
+    candidates: list[CacheCandidate] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        instance_type = item.get("instance_type") or item.get("instanceType")
+        engine_raw = item.get("cacheEngine")
+        if not instance_type or engine_raw not in ("Memcached", "Redis", "Valkey"):
+            continue
+        try:
+            vcpu = int(item.get("vcpu", 0))
+        except (TypeError, ValueError):
+            vcpu = 0
+        try:
+            memory_gib = float(item.get("memory", 0))
+        except (TypeError, ValueError):
+            memory_gib = 0.0
+        max_clients_raw = item.get("max_clients")
+        try:
+            max_clients = int(max_clients_raw) if max_clients_raw is not None else None
+        except (TypeError, ValueError):
+            max_clients = None
+        candidates.append(
+            CacheCandidate(
+                instance_type=instance_type,
+                family=item.get("family", "unknown"),
+                engine=CacheEngine(engine_raw),
+                vcpu=vcpu,
+                memory_gib=memory_gib,
+                network_performance=(
+                    item.get("network_performance")
+                    or item.get("networkPerformance")
+                    or "unknown"
+                ),
+                max_clients=max_clients,
+            )
+        )
+
+    if not candidates:
+        raise InstanceDataUnavailableError("Live cache instance data source returned no results.")
     return candidates

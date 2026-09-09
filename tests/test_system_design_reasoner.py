@@ -284,3 +284,91 @@ def test_reason_system_design_invalid_wrapper_fails_with_domain_error(mock_get_m
 
     with pytest.raises(ReasoningError):
         reason_system_design(state)
+
+
+@patch("app.agent.nodes.system_design_reasoner._maybe_collect_research", return_value=None)
+@patch("app.agent.nodes.system_design_reasoner.invoke_structured")
+def test_new_fields_parse_correctly_into_technical_needs(mock_invoke, _mock_research):
+    """
+    Confirm that a mocked LLM response including the new infrastructure
+    fields (needs_database, needs_cache, min_instances, max_instances,
+    load_balancer_needed) is accepted and round-trips through TechnicalNeeds.
+    """
+    mock_invoke.return_value = TechnicalNeeds(
+        estimated_concurrency=150,
+        resource_profile=ResourceProfile.CPU_BOUND,
+        traffic_pattern=TrafficPattern.STEADY,
+        requires_gpu=False,
+        scaling_recommendation="horizontal with auto scaling",
+        needs_database=True,
+        needs_cache=False,
+        min_instances=2,
+        max_instances=4,
+        load_balancer_needed=True,
+        reasoning="steady web app traffic at 150 concurrent; two to four instances behind ALB",
+    )
+
+    state = {
+        "requirements": UserRequirements(
+            workload_type=WorkloadType.WEB_APP,
+            registered_users=5000,
+            traffic_pattern=TrafficPattern.STEADY,
+            gpu_required=False,
+        ),
+        "latest_user_message": None,
+        "next_question": None,
+        "technical_needs": None,
+        "instance_candidates": None,
+        "recommendation": None,
+        "pending_field": None,
+    }
+    state = reason_system_design(state)
+    needs = state["technical_needs"]
+    assert needs is not None
+    assert needs.needs_database is True
+    assert needs.needs_cache is False
+    assert needs.min_instances == 2
+    assert needs.max_instances == 4
+    assert needs.load_balancer_needed is True
+
+
+@patch("app.agent.nodes.system_design_reasoner._maybe_collect_research", return_value=None)
+@patch("app.agent.nodes.system_design_reasoner.invoke_structured")
+def test_load_balancer_false_when_single_instance(mock_invoke, _mock_research):
+    """
+    When vertical scaling is recommended (min == max == 1),
+    load_balancer_needed must be false.
+    """
+    mock_invoke.return_value = TechnicalNeeds(
+        estimated_concurrency=5,
+        resource_profile=ResourceProfile.BALANCED,
+        traffic_pattern=TrafficPattern.STEADY,
+        requires_gpu=False,
+        scaling_recommendation="vertical, single instance",
+        needs_database=True,
+        needs_cache=False,
+        min_instances=1,
+        max_instances=1,
+        load_balancer_needed=False,
+        reasoning="low concurrency, no distribution needed",
+    )
+
+    state = {
+        "requirements": UserRequirements(
+            workload_type=WorkloadType.WEB_APP,
+            registered_users=100,
+            traffic_pattern=TrafficPattern.STEADY,
+            gpu_required=False,
+        ),
+        "latest_user_message": None,
+        "next_question": None,
+        "technical_needs": None,
+        "instance_candidates": None,
+        "recommendation": None,
+        "pending_field": None,
+    }
+    state = reason_system_design(state)
+    needs = state["technical_needs"]
+    assert needs.min_instances == 1
+    assert needs.max_instances == 1
+    assert needs.load_balancer_needed is False

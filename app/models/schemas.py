@@ -5,7 +5,13 @@ Defines the structured data contracts between graph nodes:
 - UserRequirements: raw information collected from the user
 - TechnicalNeeds: the system design reasoner's interpretation of those requirements
 - InstanceCandidate: a single EC2 instance type fetched from the live data source
-- InstanceRecommendation: the final structured recommendation returned to the user
+- DatabaseCandidate: a single RDS instance class fetched from the live data source
+- CacheCandidate: a single ElastiCache node type, per engine, fetched from the live data source
+- InstanceRecommendation: the final structured EC2 recommendation
+- DatabaseRecommendation: recommendation for the database tier (or explicit note that none is needed)
+- CacheRecommendation: recommendation for the cache tier (validated engine + node type)
+- LoadBalancerRecommendation: load balancer guidance derived from technical_needs
+- SystemDesignRecommendation: full V2 recommendation combining all four tiers
 """
 
 from enum import Enum
@@ -133,6 +139,26 @@ class TechnicalNeeds(BaseModel):
         ...,
         description="Vertical vs horizontal scaling view, e.g. 'horizontal with auto scaling due to bursty peak window'.",
     )
+    needs_database: bool = Field(
+        default=True,
+        description="Whether this workload needs a persistent relational database.",
+    )
+    needs_cache: bool = Field(
+        default=False,
+        description="Whether a caching layer would meaningfully help this workload.",
+    )
+    min_instances: int = Field(
+        default=1, ge=1,
+        description="Minimum number of compute instances recommended.",
+    )
+    max_instances: int = Field(
+        default=1, ge=1,
+        description="Maximum number of compute instances recommended to handle peak load.",
+    )
+    load_balancer_needed: bool = Field(
+        default=False,
+        description="Whether a load balancer is warranted — generally true when max_instances > 1.",
+    )
     reasoning: str = Field(
         ...,
         description="Explanation of how the above was derived from the raw requirements.",
@@ -181,3 +207,138 @@ class InstanceRecommendation(BaseModel):
         if v.lower() not in allowed:
             raise ValueError(f"confidence must be one of {allowed}")
         return v.lower()
+
+
+class CacheEngine(str, Enum):
+    MEMCACHED = "Memcached"
+    REDIS = "Redis"
+    VALKEY = "Valkey"
+
+
+class DatabaseCandidate(BaseModel):
+    """A single RDS database instance class as fetched from the live data source."""
+
+    instance_type: str = Field(..., description="e.g. 'db.t3.medium', 'db.r5.large'")
+    family: str = Field(
+        ...,
+        description="'General purpose', 'Memory optimized', or 'Micro instances'.",
+    )
+    vcpu: int
+    memory_gib: float
+    network_performance: str = Field(
+        default="unknown",
+        description=(
+            "Raw descriptive network performance — values are inconsistent free text, "
+            "not parseable numerics."
+        ),
+    )
+
+
+class CacheCandidate(BaseModel):
+    """
+    A single ElastiCache node type, specific to one engine.
+    Node types are not universal across engines — a given type may only
+    support Memcached, Redis, or Valkey, never all three.
+    """
+
+    instance_type: str = Field(..., description="e.g. 'cache.t3.medium', 'cache.r6g.large'")
+    family: str = Field(
+        ...,
+        description="'Standard', 'Memory optimized', or 'Network optimized'.",
+    )
+    engine: CacheEngine
+    vcpu: int
+    memory_gib: float
+    network_performance: str = "unknown"
+    max_clients: Optional[int] = None
+
+
+class DatabaseRecommendation(BaseModel):
+    """Recommendation for the database tier, or an explicit note that none is needed."""
+
+    needed: bool
+    recommended_instance: Optional[str] = None
+    engine_suggestion: Optional[str] = Field(
+        default=None,
+        description=(
+            "Suggested DB engine (e.g. 'PostgreSQL', 'MySQL') — advisory reasoning, "
+            "not validated against a fixed list, since RDS instance types generally "
+            "support multiple engines."
+        ),
+    )
+    why: str
+    assumptions: list[str] = Field(default_factory=list)
+    confidence: str
+    alternative_instance: Optional[str] = None
+
+    @field_validator("confidence")
+    @classmethod
+    def validate_confidence(cls, v: str) -> str:
+        allowed = {"low", "medium", "high"}
+        if v.lower() not in allowed:
+            raise ValueError(f"confidence must be one of {allowed}")
+        return v.lower()
+
+
+class CacheRecommendation(BaseModel):
+    """Recommendation for the cache tier, or an explicit note that none is needed."""
+
+    needed: bool
+    recommended_instance: Optional[str] = None
+    engine: Optional[CacheEngine] = Field(
+        default=None,
+        description=(
+            "Must match an actual (instance_type, engine) pair in the live candidate "
+            "set — validated, not just advisory, since cache node types are "
+            "engine-specific."
+        ),
+    )
+    why: str
+    assumptions: list[str] = Field(default_factory=list)
+    confidence: str
+    alternative_instance: Optional[str] = None
+    alternative_engine: Optional[CacheEngine] = None
+
+    @field_validator("confidence")
+    @classmethod
+    def validate_confidence(cls, v: str) -> str:
+        allowed = {"low", "medium", "high"}
+        if v.lower() not in allowed:
+            raise ValueError(f"confidence must be one of {allowed}")
+        return v.lower()
+
+
+class LoadBalancerRecommendation(BaseModel):
+    """
+    Load balancer guidance — derived from technical_needs rather than
+    live-fetched, since there is no 'instance type' for a load balancer.
+    """
+
+    needed: bool
+    load_balancer_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "e.g. 'Application Load Balancer', 'Network Load Balancer' "
+            "— omitted if not needed."
+        ),
+    )
+    why: str
+
+
+class SystemDesignRecommendation(BaseModel):
+    """
+    The full V2 recommendation: compute + database + cache + load balancing,
+    reasoned about together as a coherent architecture.
+    """
+
+    compute: InstanceRecommendation
+    database: DatabaseRecommendation
+    cache: CacheRecommendation
+    load_balancer: LoadBalancerRecommendation
+    architecture_summary: str = Field(
+        ...,
+        description=(
+            "Short summary of how the pieces work together — e.g. how the cache "
+            "reduces database load, why this instance count."
+        ),
+    )

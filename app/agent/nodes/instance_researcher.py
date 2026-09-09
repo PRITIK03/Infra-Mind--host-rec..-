@@ -10,6 +10,11 @@ instance type that exists.
 
 from __future__ import annotations
 
+from app.agent.nodes._candidate_utils import (
+    MAX_CANDIDATES as _MAX_CANDIDATES,
+    narrow_by_size as _narrow_by_size,
+    select_diverse as _select_diverse,
+)
 from app.agent.state import AgentState
 from app.models.schemas import InstanceCandidate, ResourceProfile, TechnicalNeeds
 from app.tools.aws_instance_data import fetch_ec2_instance_data
@@ -25,9 +30,6 @@ _COMPUTE_FAMILY_PREFIXES = ("c5", "c6", "c7", "c8", "hpc")
 _BALANCED_FAMILY_PREFIXES = ("m5", "m6", "m7", "m8")
 _BURSTABLE_FAMILY_PREFIXES = ("t2", "t3", "t4")
 
-# Keep the recommender prompt focused; live catalogs are large.
-_MAX_CANDIDATES = 48
-
 
 def _family_of(instance_type: str) -> str:
     return instance_type.split(".", 1)[0].lower()
@@ -42,24 +44,6 @@ def _mem_per_vcpu(candidate: InstanceCandidate) -> float:
     if candidate.vcpu <= 0:
         return 0.0
     return float(candidate.memory_gib) / float(candidate.vcpu)
-
-
-def _target_vcpu_band(needs: TechnicalNeeds) -> tuple[int, int]:
-    """
-    Soft sizing band from concurrency + scaling intent.
-    Used only to prefer relevant sizes, not as a hard architecture rule.
-    """
-    concurrency = max(int(needs.estimated_concurrency), 1)
-    horizontal = "horizontal" in (needs.scaling_recommendation or "").lower()
-    # Rough web/API heuristic: ~20–40 concurrent units per vCPU.
-    units_per_vcpu = 30
-    if horizontal:
-        # Size a share of peak across a few replicas, not the whole fleet on one box.
-        per_instance_load = max(concurrency / 4.0, 1.0)
-        mid = max(int(per_instance_load / units_per_vcpu), 2)
-    else:
-        mid = max(int(concurrency / units_per_vcpu), 2)
-    return max(mid // 4, 1), max(mid * 4, mid + 2)
 
 
 def _profile_prefixes(needs: TechnicalNeeds) -> tuple[str, ...] | None:
@@ -101,51 +85,6 @@ def _filter_by_profile(
     if needs.resource_profile == ResourceProfile.CPU_BOUND:
         return [c for c in all_instances if c.vcpu > 0 and c.gpu_count == 0 and _mem_per_vcpu(c) <= 3.0]
     return [c for c in all_instances if c.vcpu > 0 and c.gpu_count == 0 and 2.5 <= _mem_per_vcpu(c) <= 5.5]
-
-
-def _narrow_by_size(
-    candidates: list[InstanceCandidate],
-    needs: TechnicalNeeds,
-) -> list[InstanceCandidate]:
-    lo, hi = _target_vcpu_band(needs)
-    in_band = [c for c in candidates if lo <= c.vcpu <= hi]
-    if len(in_band) >= 8:
-        return in_band
-    # Expand gradually so sparse catalogs still produce options.
-    wider = [c for c in candidates if max(lo // 2, 1) <= c.vcpu <= hi * 2]
-    return wider or candidates
-
-
-def _select_diverse(candidates: list[InstanceCandidate], limit: int = _MAX_CANDIDATES) -> list[InstanceCandidate]:
-    """Prefer a spread of sizes over dumping near-duplicates into the LLM."""
-    if len(candidates) <= limit:
-        return sorted(candidates, key=lambda c: (c.vcpu, c.memory_gib, c.instance_type))
-
-    ordered = sorted(candidates, key=lambda c: (c.vcpu, c.memory_gib, c.instance_type))
-    if limit == 1:
-        return [ordered[len(ordered) // 2]]
-
-    selected: list[InstanceCandidate] = []
-    seen_types: set[str] = set()
-    for index in range(limit):
-        pos = round(index * (len(ordered) - 1) / (limit - 1))
-        candidate = ordered[pos]
-        if candidate.instance_type in seen_types:
-            continue
-        selected.append(candidate)
-        seen_types.add(candidate.instance_type)
-
-    # Fill remaining slots from unused mid-range types if sampling collided.
-    if len(selected) < limit:
-        for candidate in ordered:
-            if candidate.instance_type in seen_types:
-                continue
-            selected.append(candidate)
-            seen_types.add(candidate.instance_type)
-            if len(selected) >= limit:
-                break
-
-    return sorted(selected, key=lambda c: (c.vcpu, c.memory_gib, c.instance_type))
 
 
 def research_instances(state: AgentState) -> AgentState:
