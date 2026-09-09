@@ -38,8 +38,6 @@ Scope deliberately bounded:
 """
 from __future__ import annotations
 
-from string import Template
-
 from app.agent.state import AgentState
 from app.models.schemas import (
     CacheEngine,
@@ -134,30 +132,31 @@ _AI_WARNING_BLOCK = """\
 """
 
 
-_HEADER = """\
-terraform {
-  required_providers {
-    aws = {
+def _header() -> str:
+    return f"""\
+terraform {{
+  required_providers {{
+    aws = {{
       source  = "hashicorp/aws"
-      version = "${aws_provider_version}"
-    }
-  }
-}
+      version = "{AWS_PROVIDER_VERSION}"
+    }}
+  }}
+}}
 
-provider "aws" {
+provider "aws" {{
   region = var.aws_region
-}
+}}
 
-data "aws_vpc" "default" {
+data "aws_vpc" "default" {{
   default = true
-}
+}}
 
-data "aws_subnets" "default" {
-  filter {
+data "aws_subnets" "default" {{
+  filter {{
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
-  }
-}
+  }}
+}}
 """
 
 
@@ -283,149 +282,163 @@ resource "aws_security_group" "compute" {
 """
 
 
-_SG_DB_FROM_COMPUTE = """\
-resource "aws_security_group" "db" {
-  name        = "${var.app_name}-db-sg"
+def _sg_db_from_compute(db_port: int) -> str:
+    return f"""\
+resource "aws_security_group" "db" {{
+  name        = "${{var.app_name}}-db-sg"
   description = "Allow RDS port only from compute security group."
   vpc_id      = data.aws_vpc.default.id
 
-  ingress {
-    from_port       = ${db_port}
-    to_port         = ${db_port}
+  ingress {{
+    from_port       = {db_port}
+    to_port         = {db_port}
     protocol        = "tcp"
     security_groups = [aws_security_group.compute.id]
-  }
+  }}
 
-  egress {
+  egress {{
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-  }
+  }}
 
-  tags = {
-    Name = "${var.app_name}-db-sg"
-  }
-}
+  tags = {{
+    Name = "${{var.app_name}}-db-sg"
+  }}
+}}
 """
 
 
-_SG_CACHE_FROM_COMPUTE = """\
-resource "aws_security_group" "cache" {
-  name        = "${var.app_name}-cache-sg"
+def _sg_cache_from_compute(cache_port: int) -> str:
+    return f"""\
+resource "aws_security_group" "cache" {{
+  name        = "${{var.app_name}}-cache-sg"
   description = "Allow cache port only from compute security group."
   vpc_id      = data.aws_vpc.default.id
 
-  ingress {
-    from_port       = ${cache_port}
-    to_port         = ${cache_port}
+  ingress {{
+    from_port       = {cache_port}
+    to_port         = {cache_port}
     protocol        = "tcp"
     security_groups = [aws_security_group.compute.id]
-  }
+  }}
 
-  egress {
+  egress {{
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-  }
+  }}
 
-  tags = {
-    Name = "${var.app_name}-cache-sg"
-  }
-}
+  tags = {{
+    Name = "${{var.app_name}}-cache-sg"
+  }}
+}}
 """
 
 
-_LAUNCH_TEMPLATE_ASG = """\
-resource "aws_launch_template" "app" {
-  name_prefix   = "${var.app_name}-lt-"
-  image_id      = "ami-0c101f26f44444444"
-  instance_type = "${compute_instance}"
+def _launch_template_asg(
+    *,
+    compute_instance: str,
+    min_instances: int,
+    max_instances: int,
+    with_target_group: bool,
+) -> str:
+    tg_line = (
+        "  target_group_arns = [aws_lb_target_group.app.arn]\n"
+        if with_target_group
+        else ""
+    )
+    return f"""\
+resource "aws_launch_template" "app" {{
+  name_prefix = "${{var.app_name}}-lt-"
+  image_id = "ami-0c101f26f44444444"
+  instance_type = "{compute_instance}"
 
   vpc_security_group_ids = [aws_security_group.compute.id]
 
-  tag_specifications {
+  tag_specifications {{
     resource_type = "instance"
-    tags = {
-      Name = "${var.app_name}-instance"
-    }
-  }
+    tags = {{
+      Name = "${{var.app_name}}-instance"
+    }}
+  }}
 
-  lifecycle {
+  lifecycle {{
     create_before_destroy = true
-  }
-}
+  }}
+}}
 
-resource "aws_autoscaling_group" "app" {
-  name_prefix          = "${var.app_name}-asg-"
-  min_size             = ${min_instances}
-  max_size             = ${max_instances}
-  desired_capacity     = ${min_instances}
-  vpc_zone_identifier  = data.aws_subnets.default.ids
+resource "aws_autoscaling_group" "app" {{
+  name_prefix = "${{var.app_name}}-asg-"
+  min_size = {min_instances}
+  max_size = {max_instances}
+  desired_capacity = {min_instances}
+  vpc_zone_identifier = data.aws_subnets.default.ids
 
-  launch_template {
-    id      = aws_launch_template.app.id
+  launch_template {{
+    id = aws_launch_template.app.id
     version = "$Latest"
-  }
-${target_group_attachment}
-  tag {
-    key                 = "Name"
-    value               = "${var.app_name}-asg-instance"
+  }}
+{tg_line}  tag {{
+    key = "Name"
+    value = "${{var.app_name}}-asg-instance"
     propagate_at_launch = true
-  }
-}
+  }}
+}}
 """
 
 
-_ASG_TG_ATTACHMENT = """\
-  target_group_arns    = [aws_lb_target_group.app.arn]
-"""
-
-
-_ASG_NO_TG_ATTACHMENT = ""
-
-
-_RDS_INSTANCE = """\
-resource "aws_db_instance" "app" {
-  identifier             = "${var.app_name}-db"
-  engine                 = "${db_engine}"
-  instance_class         = "${db_instance}"
-  allocated_storage   = 20
-  db_name              = "appdb"
-  username             = var.db_username
-  password             = var.db_password
+def _rds_instance(*, db_engine: str, db_instance: str) -> str:
+    return f"""\
+resource "aws_db_instance" "app" {{
+  identifier = "${{var.app_name}}-db"
+  engine = "{db_engine}"
+  instance_class = "{db_instance}"
+  allocated_storage = 20
+  db_name = "appdb"
+  username = var.db_username
+  password = var.db_password
   skip_final_snapshot = true
   vpc_security_group_ids = [aws_security_group.db.id]
-  publicly_accessible  = false
-}
+  publicly_accessible = false
+}}
 """
 
 
-_CACHE_MEMCACHED_CLUSTER = """\
-resource "aws_elasticache_cluster" "app" {
-  cluster_id           = "${var.app_name}-cache"
-  engine               = "memcached"
-  node_type            = "${cache_instance}"
-  num_cache_nodes      = 1
+def _cache_memcached_cluster(*, cache_instance: str, cache_port: int) -> str:
+    return f"""\
+resource "aws_elasticache_cluster" "app" {{
+  cluster_id = "${{var.app_name}}-cache"
+  engine = "memcached"
+  node_type = "{cache_instance}"
+  num_cache_nodes = 1
   parameter_group_name = "default.memcached1.6"
-  port                 = ${cache_port}
-  security_group_ids   = [aws_security_group.cache.id]
-}
+  port = {cache_port}
+  security_group_ids = [aws_security_group.cache.id]
+}}
 """
 
 
-_CACHE_REPLICATION_GROUP = """\
-resource "aws_elasticache_replication_group" "app" {
-  replication_group_id          = "${var.app_name}-cache"
-  replication_group_description = "Cache tier for ${var.app_name}"
-  engine                        = "${cache_engine}"
-  node_type                     = "${cache_instance}"
-  num_cache_clusters          = 1
-  parameter_group_name    = "${param_group}"
-  port                          = ${cache_port}
-  security_group_ids            = [aws_security_group.cache.id]
-}
+def _cache_replication_group(
+    *,
+    cache_engine: str,
+    cache_instance: str,
+    cache_port: int,
+    param_group: str,
+) -> str:
+    return f"""\
+resource "aws_elasticache_replication_group" "app" {{
+  replication_group_id = "${{var.app_name}}-cache"
+  replication_group_description = "Cache tier for ${{var.app_name}}"
+  engine = "{cache_engine}"
+  node_type = "{cache_instance}"
+  num_cache_clusters = 1
+  parameter_group_name = "{param_group}"
+  port = {cache_port}
+  security_group_ids = [aws_security_group.cache.id]
+}}
 """
 
 
@@ -513,10 +526,6 @@ resource "aws_lb_listener" "app" {
 """
 
 
-_OUTPUTS_BASE = """\
-"""
-
-
 _OUTPUT_ALB = """\
 output "load_balancer_dns_name" {
   description = "DNS name of the application load balancer."
@@ -568,9 +577,7 @@ def _build_main(
     parts.append(_comment_block(sdr.architecture_summary))
     parts.append("")
 
-    parts.append(Template(_HEADER).substitute(
-        aws_provider_version=AWS_PROVIDER_VERSION,
-    ))
+    parts.append(_header())
     parts.append("")
 
     # Security groups
@@ -583,33 +590,27 @@ def _build_main(
     parts.append("")
 
     if sdr.database.needed:
-        db_port = RDS_PORT
-        parts.append(Template(_SG_DB_FROM_COMPUTE).substitute(db_port=db_port))
+        parts.append(_sg_db_from_compute(RDS_PORT))
         parts.append("")
 
     if sdr.cache.needed and sdr.cache.engine:
         cache_info = CACHE_ENGINE_RESOURCE_MAP[sdr.cache.engine]
-        cache_port = cache_info["port"]
-        parts.append(Template(_SG_CACHE_FROM_COMPUTE).substitute(cache_port=cache_port))
+        parts.append(_sg_cache_from_compute(cache_info["port"]))
         parts.append("")
 
     # Launch template + ASG
-    if sdr.load_balancer.needed:
-        tg_attachment = _ASG_TG_ATTACHMENT
-    else:
-        tg_attachment = _ASG_NO_TG_ATTACHMENT
-    parts.append(Template(_LAUNCH_TEMPLATE_ASG).substitute(
+    parts.append(_launch_template_asg(
         compute_instance=sdr.compute.recommended_instance,
         min_instances=tn.min_instances,
         max_instances=tn.max_instances,
-        target_group_attachment=tg_attachment,
+        with_target_group=sdr.load_balancer.needed,
     ))
     parts.append("")
 
     # Database
     if sdr.database.needed and sdr.database.recommended_instance:
         db_engine = _rds_engine(sdr.database.engine_suggestion)
-        parts.append(Template(_RDS_INSTANCE).substitute(
+        parts.append(_rds_instance(
             db_engine=db_engine,
             db_instance=sdr.database.recommended_instance,
         ))
@@ -621,17 +622,18 @@ def _build_main(
         cache_engine_str = cache_info["engine"]
         cache_instance = sdr.cache.recommended_instance
         cache_port = cache_info["port"]
-        resource_tmpl = (
-            _CACHE_MEMCACHED_CLUSTER
-            if cache_info["resource_type"] == "aws_elasticache_cluster"
-            else _CACHE_REPLICATION_GROUP
-        )
-        parts.append(Template(resource_tmpl).substitute(
-            cache_engine=cache_engine_str,
-            cache_instance=cache_instance,
-            cache_port=cache_port,
-            param_group=_param_group(sdr.cache.engine),
-        ))
+        if cache_info["resource_type"] == "aws_elasticache_cluster":
+            parts.append(_cache_memcached_cluster(
+                cache_instance=cache_instance,
+                cache_port=cache_port,
+            ))
+        else:
+            parts.append(_cache_replication_group(
+                cache_engine=cache_engine_str,
+                cache_instance=cache_instance,
+                cache_port=cache_port,
+                param_group=_param_group(sdr.cache.engine),
+            ))
         parts.append("")
 
     # Load balancer
@@ -650,7 +652,6 @@ def _build_outputs(
     sdr: SystemDesignRecommendation,
 ) -> str:
     parts: list[str] = []
-    parts.append(_OUTPUTS_BASE)
     if sdr.load_balancer.needed:
         parts.append(_OUTPUT_ALB)
     if sdr.database.needed and sdr.database.recommended_instance:

@@ -294,15 +294,16 @@ def test_scenario1_all_four_tiers_redis():
     assert "aws_elasticache_replication_group" in main
     assert "aws_elasticache_cluster" not in main  # Redis -> replication_group
     assert 'instance_type = "m5.xlarge"' in main
-    assert "min_size             = 4" in main
-    assert "max_size             = 12" in main
-    assert "aws_lb_target_group.app.arn" in main
+    assert "min_size = 4" in main
+    assert "max_size = 12" in main
+    assert "target_group_arns = [aws_lb_target_group.app.arn]" in main
     assert 'identifier = "${var.app_name}-db"' in main
-    assert 'engine                 = "postgres"' in main
-    assert 'instance_class         = "db.m5.large"' in main
+    assert 'engine = "postgres"' in main
+    assert 'instance_class = "db.m5.large"' in main
     assert "aws_security_group.lb.id" in main
     assert "aws_security_group.compute.id" in main
-    assert "aws_security_group.db.id" not in main  # SG block itself has name =
+    # SG "db" security_group_ids = [aws_security_group.db.id] reference must appear in DB instance
+    assert "aws_security_group.db.id" in main  # yes, inside vpc_security_group_ids = [...]
     assert "load_balancer_type = \"application\"" in main
 
     outputs = files["outputs.tf"]
@@ -323,13 +324,13 @@ def test_scenario2_all_four_tiers_valkey():
     assert 'engine = "valkey"' in main
     assert "aws_elasticache_replication_group" in main
     assert "aws_elasticache_cluster" not in main  # Valkey -> replication_group
-    assert 'parameter_group_name    = "default.valkey7.2"' in main
+    assert 'parameter_group_name = "default.valkey7.2"' in main
     assert 'instance_type = "m5.large"' in main
-    assert "min_size             = 2" in main
-    assert "max_size             = 6" in main
-    assert 'engine                 = "mysql"' in main
-    assert 'instance_class         = "db.t3.large"' in main
-    assert 'node_type                     = "cache.r5.xlarge"' in main
+    assert "min_size = 2" in main
+    assert "max_size = 6" in main
+    assert 'engine = "mysql"' in main
+    assert 'instance_class = "db.t3.large"' in main
+    assert 'node_type = "cache.r5.xlarge"' in main
 
     # Valkey replication group output uses same output template as Redis
     assert "primary_endpoint_address" in outputs
@@ -357,13 +358,13 @@ def test_scenario3_db_only_no_cache_no_lb_single_instance():
     assert "aws_security_group.cache" not in main
 
     # ASG sized 1/1, no target group attachment
-    assert "min_size             = 1" in main
-    assert "max_size             = 1" in main
+    assert "min_size = 1" in main
+    assert "max_size = 1" in main
     assert "target_group_arns" not in main
 
     # DB present
-    assert 'instance_class         = "db.t3.small"' in main
-    assert 'engine                 = "postgres"' in main
+    assert 'instance_class = "db.t3.small"' in main
+    assert 'engine = "postgres"' in main
 
     # outputs
     assert "load_balancer_dns_name" not in outputs
@@ -392,8 +393,8 @@ def test_scenario4_neither_db_nor_cache_batch():
 
     # Single c5.xlarge ASG 1/1
     assert 'instance_type = "c5.xlarge"' in main
-    assert "min_size             = 1" in main
-    assert "max_size             = 1" in main
+    assert "min_size = 1" in main
+    assert "max_size = 1" in main
 
     # Outputs: empty (nothing to expose)
     assert outputs.strip() == ""
@@ -413,7 +414,7 @@ def test_rds_engine_fallback_for_unknown():
     )
     out = generate_terraform(_state_with(sdr, tn))
     main = out["terraform_files"]["main.tf"]
-    assert 'engine                 = "postgres"' in main  # safe fallback
+    assert 'engine = "postgres"' in main  # safe fallback
 
 
 def test_missing_state_raises():
