@@ -201,7 +201,7 @@ def _tier_reasoning(reasoning: str, tier: str) -> str:
     lowered = reasoning.lower()
     if not any(re.search(rf"\b{re.escape(keyword)}\b", lowered) for keyword in keywords):
         return "Not required for this workload."
-    excerpt = reasoning.strip()[:240].strip()
+    excerpt = reasoning.strip()
     return excerpt or "Not required for this workload."
 
 

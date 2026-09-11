@@ -222,6 +222,25 @@ def test_skipped_tier_uses_relevant_reasoning_excerpt(mock_invoke):
 
 
 @patch("app.agent.nodes.holistic_recommender.invoke_structured")
+def test_skipped_tier_preserves_long_reasoning(mock_invoke):
+    mock_invoke.return_value = _full_result()
+    reasoning = (
+        "The batch workload does not need a cache because it has one worker slot, "
+        "steady execution, no repeated hot-read pattern, and no shared transient "
+        "state between concurrent workers. This full rationale must remain intact "
+        "for the report and Markdown export."
+    )
+    state = _base_state(
+        technical_needs=_needs(needs_cache=False, reasoning=reasoning),
+        cache_candidates=[],
+    )
+
+    sdr = recommend_system_design(state)["system_design_recommendation"]
+
+    assert sdr.cache.why == reasoning
+
+
+@patch("app.agent.nodes.holistic_recommender.invoke_structured")
 def test_both_skipped_tiers_still_produce_valid_compute(mock_invoke):
     mock_invoke.return_value = _full_result()
     state = _base_state(
