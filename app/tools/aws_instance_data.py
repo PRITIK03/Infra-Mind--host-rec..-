@@ -35,6 +35,39 @@ _RETRYABLE_EXCEPTIONS = (
     http.client.HTTPException,
 )
 
+# Default region for on-demand pricing lookup.
+_DEFAULT_REGION = "us-east-1"
+
+
+def _extract_hourly_price(pricing: Any, region: str, subkey: str) -> float | None:
+    """
+    Pull the ``ondemand`` hourly price from a nested Vantage ``pricing`` dict.
+
+    Structure for EC2:  pricing[region]["linux"]["ondemand"]  (string)
+    Structure for RDS:  pricing[region][<engine>]["ondemand"] (float)
+    Structure for cache: pricing[region][<engine>]["ondemand"] (float)
+
+    Returns None when the price is absent, malformed, or not a positive number.
+    """
+    if not isinstance(pricing, dict):
+        return None
+    region_data = pricing.get(region)
+    if not isinstance(region_data, dict):
+        return None
+    sub = region_data.get(subkey)
+    if not isinstance(sub, dict):
+        return None
+    raw = sub.get("ondemand")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
 
 def _is_retryable_exception(exc: Exception) -> bool:
     if isinstance(exc, _RETRYABLE_EXCEPTIONS):
@@ -150,7 +183,7 @@ def _item_to_candidate(item: dict[str, Any]) -> InstanceCandidate | None:
         gpu_model=item.get("GPU_model"),
         gpu_memory_gib=item.get("GPU_memory"),
         network_performance=item.get("network_performance") or item.get("networkPerformance"),
-        hourly_price_usd=None,  # add pricing lookup in a later phase
+        hourly_price_usd=_extract_hourly_price(item.get("pricing"), _DEFAULT_REGION, "linux"),
     )
 
 
@@ -208,12 +241,39 @@ def fetch_rds_instance_data() -> list[DatabaseCandidate]:
                     or item.get("networkPerformance")
                     or "unknown"
                 ),
+                hourly_price_usd=_extract_rds_hourly_price(item.get("pricing")),
             )
         )
 
     if not candidates:
         raise InstanceDataUnavailableError("Live RDS instance data source returned no results.")
     return candidates
+
+
+def _extract_rds_hourly_price(pricing: Any) -> float | None:
+    """
+    RDS pricing is nested by engine key (e.g. 'PostgreSQL', 'MySQL').
+    Try canonical engine names in priority order, then fall back to the
+    first numeric 'ondemand' value found.  Region is fixed to us-east-1.
+    """
+    # Priority order for engine lookups
+    engine_keys = ("PostgreSQL", "MySQL", "MariaDB", "oracle-ee", "oracle-se2")
+    price = None
+    region_data = None
+    if isinstance(pricing, dict):
+        region_data = pricing.get(_DEFAULT_REGION)
+    if isinstance(region_data, dict):
+        for ek in engine_keys:
+            price = _extract_hourly_price(pricing, _DEFAULT_REGION, ek)
+            if price is not None:
+                return price
+        # Fallback: any key with a numeric ondemand under us-east-1
+        for subkey, subval in region_data.items():
+            if isinstance(subval, dict) and "ondemand" in subval:
+                price = _extract_hourly_price(pricing, _DEFAULT_REGION, subkey)
+                if price is not None:
+                    return price
+    return None
 
 
 def fetch_cache_instance_data() -> list[CacheCandidate]:
@@ -261,6 +321,9 @@ def fetch_cache_instance_data() -> list[CacheCandidate]:
                     or "unknown"
                 ),
                 max_clients=max_clients,
+                hourly_price_usd=_extract_hourly_price(
+                    item.get("pricing"), _DEFAULT_REGION, engine_raw
+                ),
             )
         )
 

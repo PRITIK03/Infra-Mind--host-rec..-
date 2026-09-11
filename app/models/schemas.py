@@ -232,6 +232,10 @@ class DatabaseCandidate(BaseModel):
             "not parseable numerics."
         ),
     )
+    hourly_price_usd: Optional[float] = Field(
+        default=None,
+        description="On-demand hourly price for us-east-1, if available from the source.",
+    )
 
 
 class CacheCandidate(BaseModel):
@@ -251,6 +255,10 @@ class CacheCandidate(BaseModel):
     memory_gib: float
     network_performance: str = "unknown"
     max_clients: Optional[int] = None
+    hourly_price_usd: Optional[float] = Field(
+        default=None,
+        description="On-demand hourly price for us-east-1, if available from the source.",
+    )
 
 
 class DatabaseRecommendation(BaseModel):
@@ -325,6 +333,40 @@ class LoadBalancerRecommendation(BaseModel):
     why: str
 
 
+class EstimatedCost(BaseModel):
+    """
+    Estimated monthly on-demand cost for the recommended architecture.
+
+    All fields are Optional[float]: None means pricing data was unavailable
+    for that tier rather than a fabricated zero.
+    """
+
+    compute_monthly_low: Optional[float] = Field(
+        default=None,
+        description="Monthly cost at min_instances (hourly_price × min × 730h).",
+    )
+    compute_monthly_high: Optional[float] = Field(
+        default=None,
+        description="Monthly cost at max_instances (hourly_price × max × 730h).",
+    )
+    database_monthly: Optional[float] = Field(
+        default=None,
+        description="Monthly cost for the recommended RDS instance (× 730h), or None if DB not needed / pricing unavailable.",
+    )
+    cache_monthly: Optional[float] = Field(
+        default=None,
+        description="Monthly cost for the recommended cache node (× 730h), or None if cache not needed / pricing unavailable.",
+    )
+    total_monthly_low: Optional[float] = Field(
+        default=None,
+        description="Sum of compute low + database + cache (any None → None).",
+    )
+    total_monthly_high: Optional[float] = Field(
+        default=None,
+        description="Sum of compute high + database + cache (any None → None).",
+    )
+
+
 class SystemDesignRecommendation(BaseModel):
     """
     The full V2 recommendation: compute + database + cache + load balancing,
@@ -340,5 +382,31 @@ class SystemDesignRecommendation(BaseModel):
         description=(
             "Short summary of how the pieces work together — e.g. how the cache "
             "reduces database load, why this instance count."
+        ),
+    )
+    estimated_cost: Optional[EstimatedCost] = Field(
+        default=None,
+        description=(
+            "Estimated monthly on-demand cost for the recommended architecture. "
+            "None when pricing data is unavailable."
+        ),
+    )
+    # Grounding check results — populated by grounding_check node.
+    # grounding_passed=None means the check has not run yet (pre-grounding).
+    # grounding_passed=False means the check ran and found unresolved issues
+    # after one bounded retry — the recommendation is visible but flagged.
+    grounding_passed: Optional[bool] = Field(
+        default=None,
+        description=(
+            "True if the grounding/consistency check passed; False if it failed "
+            "after a bounded retry (recommendation flagged, not suppressed); "
+            "None if the check has not run yet."
+        ),
+    )
+    grounding_notes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Issues found by the grounding check that remain unresolved. "
+            "Empty when grounding_passed is True or None."
         ),
     )

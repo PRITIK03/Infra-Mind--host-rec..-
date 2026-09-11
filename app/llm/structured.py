@@ -4,8 +4,11 @@ Provider-agnostic structured output extraction and fallback logic.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import threading
+import time
 from typing import Any, Callable, TypeVar
 
 from langchain_openai import ChatOpenAI
@@ -18,6 +21,92 @@ T = TypeVar("T", bound=BaseModel)
 
 class StructuredOutputError(RuntimeError):
     """Raised when the LLM fails to produce valid structured output."""
+
+
+# ---------------------------------------------------------------------------
+# Response cache
+# ---------------------------------------------------------------------------
+# Keyed on (schema_name, sha256(normalized_prompt)).  "Normalized" means
+# collapsed whitespace so minor formatting changes don't defeat the cache.
+#
+# TTL: 1 hour — long enough to absorb repeated identical requests during
+# free-tier-constrained testing sessions; short enough that stale results
+# don't persist across meaningful context changes.
+#
+# Max size: 200 entries.  At ~50 KB/entry (a realistic structured response)
+# that's ~10 MB worst-case, well within a small cloud instance's headroom.
+#
+# Which calls are NOT cached
+# --------------------------
+# GroundingResult calls are deliberately excluded from caching even though
+# they share this code path.  Grounding checks are cheap single-call audits
+# whose correctness depends on the exact (recommendation, technical_needs)
+# pair produced moments earlier — caching them could mask a freshly
+# introduced inconsistency in the recommendation they're meant to catch.
+# The exclusion is enforced by checking schema.__name__ == "GroundingResult"
+# before the cache lookup.
+#
+# All other schemas (TechnicalNeeds, SystemDesignRecommendation, etc.) are
+# cached: the same prompt content always warrants the same structured
+# response within the TTL window.
+
+_CACHE_TTL_S: float = 3600.0   # 1 hour
+_CACHE_MAX_SIZE: int = 200
+
+# Each entry: {"value": T, "expires_at": float}
+_cache: dict[str, dict[str, Any]] = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_key(schema_name: str, prompt: str) -> str:
+    """Stable cache key: schema name + SHA-256 of whitespace-normalised prompt."""
+    normalised = re.sub(r"\s+", " ", prompt).strip()
+    digest = hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+    return f"{schema_name}:{digest}"
+
+
+def _cache_get(key: str) -> Any | None:
+    """Return cached value if present and not expired, else None."""
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() > entry["expires_at"]:
+            del _cache[key]
+            return None
+        return entry["value"]
+
+
+def _cache_put(key: str, value: Any) -> None:
+    """Insert value; evict oldest entries when over capacity."""
+    with _cache_lock:
+        # Evict expired entries first (cheap scan, keeps the dict tidy).
+        now = time.monotonic()
+        expired = [k for k, v in _cache.items() if now > v["expires_at"]]
+        for k in expired:
+            del _cache[k]
+        # If still over capacity, evict the entry with the smallest expires_at.
+        while len(_cache) >= _CACHE_MAX_SIZE:
+            oldest = min(_cache, key=lambda k: _cache[k]["expires_at"])
+            del _cache[oldest]
+        _cache[key] = {"value": value, "expires_at": now + _CACHE_TTL_S}
+
+
+def _cache_clear() -> None:
+    """Clear all cache entries.  Intended for tests only."""
+    with _cache_lock:
+        _cache.clear()
+
+
+def _is_cacheable(schema: type) -> bool:
+    """
+    Return True when responses for *schema* should be cached.
+
+    GroundingResult is excluded: each check audits a freshly produced
+    recommendation and must never reuse a stale verdict.  All other
+    structured schemas benefit from caching identical prompts.
+    """
+    return schema.__name__ != "GroundingResult"
 
 
 def _message_text(response: object) -> str:
@@ -151,9 +240,27 @@ def invoke_structured(
     ``_retry_context`` ContextVar automatically — no explicit wiring
     needed from callers. The optional ``retry_callback`` kwarg overrides
     the context var and is mainly useful in tests.
+
+    Response caching
+    ----------------
+    Identical (schema, normalised-prompt) pairs are served from an
+    in-memory cache (TTL 1h, max 200 entries) to reduce redundant LLM
+    calls during free-tier-constrained testing.  GroundingResult calls
+    are intentionally excluded — see _is_cacheable() for rationale.
+    Cache bypassing is automatic when retry_callback is supplied (tests
+    that need fresh responses can pass a no-op lambda).
     """
     schema_name = schema.__name__
     schema_json = json.dumps(schema.model_json_schema(), indent=2)
+
+    # ── Cache lookup (skipped for GroundingResult and explicit test overrides) ──
+    use_cache = _is_cacheable(schema) and retry_callback is None
+    cache_key: str | None = None
+    if use_cache:
+        cache_key = _cache_key(schema_name, prompt)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
 
     def _run_attempt(active_prompt: str) -> T:
         json_prompt = (
@@ -211,13 +318,13 @@ def invoke_structured(
             ) from fallback_exc
 
     try:
-        return _run_attempt(prompt)
+        result = _run_attempt(prompt)
     except RateLimitExhaustedError:
         raise
     except Exception:
         # One bounded retry of the entire primary+fallback unit — do not loop.
         try:
-            return _run_attempt(f"{prompt}\n\n{_JSON_RETRY_NOTE}")
+            result = _run_attempt(f"{prompt}\n\n{_JSON_RETRY_NOTE}")
         except RateLimitExhaustedError:
             raise
         except StructuredOutputError:
@@ -227,3 +334,9 @@ def invoke_structured(
                 f"Failed to obtain valid {schema_name} from the LLM after retry. "
                 f"Last error: {retry_exc}"
             ) from retry_exc
+
+    # ── Cache store ────────────────────────────────────────────────────────
+    if use_cache and cache_key is not None:
+        _cache_put(cache_key, result)
+
+    return result

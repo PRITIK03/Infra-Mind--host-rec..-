@@ -39,13 +39,15 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import threading
 import time
 import uuid
+from collections import deque
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from app.agent.graph import build_graph
 from app.agent.state import AgentState
@@ -72,11 +74,27 @@ JOB_TIMEOUT_SECONDS: float = float(os.getenv("JOB_TIMEOUT_SECONDS", "600"))
 
 
 class RecommendRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=10_000)
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("message must contain non-whitespace text")
+        return value
 
 
 class AnswerRequest(BaseModel):
-    answer: str
+    answer: str = Field(..., min_length=1, max_length=2_000)
+
+    @field_validator("answer")
+    @classmethod
+    def validate_answer(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("answer must contain non-whitespace text")
+        return value
 
 
 api_settings = get_api_settings()
@@ -85,13 +103,53 @@ app = FastAPI(title="AWS Instance Advisor API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[api_settings.cors_allowed_origin],
+    allow_origins=(
+        [api_settings.cors_allowed_origin]
+        if api_settings.cors_allowed_origin
+        else []
+    ),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 jobs = JobStore()
+
+
+class InMemoryRateLimiter:
+    """Small process-local sliding-window limiter for expensive public requests."""
+
+    def __init__(self, max_requests: int, window_seconds: float) -> None:
+        self.max_requests = max(1, max_requests)
+        self.window_seconds = max(1.0, window_seconds)
+        self._requests: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, client_id: str, now: float | None = None) -> tuple[bool, int]:
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            timestamps = self._requests.setdefault(client_id, deque())
+            cutoff = current - self.window_seconds
+            while timestamps and timestamps[0] <= cutoff:
+                timestamps.popleft()
+            if len(timestamps) >= self.max_requests:
+                retry_after = max(1, int(self.window_seconds - (current - timestamps[0])))
+                return False, retry_after
+            timestamps.append(current)
+            return True, 0
+
+    def clear(self) -> None:
+        """Clear state for tests and controlled in-process maintenance."""
+        with self._lock:
+            self._requests.clear()
+
+
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "5"))
+RATE_LIMIT_WINDOW_SECONDS = float(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+recommend_rate_limiter = InMemoryRateLimiter(
+    RATE_LIMIT_MAX_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+)
 
 # Single shared executor for all background agent runs.
 # Defined at module level so it is shared across requests and can be
@@ -181,6 +239,7 @@ def _graph_loop_sync(job_id: str, initial_state: AgentState) -> None:
     independent wall-clock safety net.
     """
     state = initial_state
+    job_start = time.monotonic()
     try:
         while True:
             state = _run_graph_with_streaming(job_id, state, collecting=True)
@@ -191,6 +250,7 @@ def _graph_loop_sync(job_id: str, initial_state: AgentState) -> None:
             ):
                 final = _serialize_result(state)
                 jobs.update_status(job_id, "done", result=final)
+                _record_completed_run(job_id, state, job_start)
                 return
 
             if state.get("next_question"):
@@ -220,6 +280,7 @@ def _resume_with_answer_sync(job_id: str, answer: str) -> None:
     state = job.state
     state["latest_user_message"] = answer
     jobs.update_status(job_id, "running")
+    job_start = time.monotonic()
     try:
         while True:
             state = _run_graph_with_streaming(job_id, state, collecting=True)
@@ -230,6 +291,7 @@ def _resume_with_answer_sync(job_id: str, answer: str) -> None:
             ):
                 final = _serialize_result(state)
                 jobs.update_status(job_id, "done", result=final)
+                _record_completed_run(job_id, state, job_start)
                 return
 
             if state.get("next_question"):
@@ -289,11 +351,76 @@ def _submit_with_timeout(fn, *args) -> None:
     threading.Thread(target=_watchdog, daemon=True, name=f"watchdog-{job_id}").start()
 
 
+def _record_completed_run(
+    job_id: str,
+    state: AgentState,
+    job_start: float,
+) -> None:
+    """
+    Fire-and-forget observability record for a successfully completed job.
+    Extracts grounding status and cost from the final state and calls
+    persist_run, which logs to stdout and optionally writes to the DB.
+    """
+    try:
+        from app.observability import persist_run
+        from app.config import get_llm_settings
+
+        total_latency_s = time.monotonic() - job_start
+
+        # Model name from config — this is the model that produced the run.
+        try:
+            model_used = get_llm_settings().model_name
+        except Exception:
+            model_used = None
+
+        # Retry count: read from the job's current retry_info string.
+        # retry_info is None (success) or a string like "Retrying … (attempt N of M)".
+        # We track the highest attempt number seen; for a clean run it's 0.
+        job = jobs.get(job_id)
+        retry_count = 0
+        if job is not None and job.retry_info:
+            import re
+            m = re.search(r"attempt (\d+)", job.retry_info)
+            if m:
+                retry_count = int(m.group(1))
+
+        # Grounding result and cost from the recommendation.
+        grounding_passed: bool | None = None
+        cost_low: float | None = None
+        cost_high: float | None = None
+
+        sdr = state.get("system_design_recommendation")
+        if sdr is not None:
+            if hasattr(sdr, "grounding_passed"):
+                grounding_passed = sdr.grounding_passed
+            cost = getattr(sdr, "estimated_cost", None)
+            if cost is not None:
+                cost_low = getattr(cost, "total_monthly_low", None)
+                cost_high = getattr(cost, "total_monthly_high", None)
+
+        persist_run(
+            job_id=job_id,
+            total_latency_s=total_latency_s,
+            model_used=model_used,
+            retry_count=retry_count,
+            grounding_passed=grounding_passed,
+            estimated_cost_low=cost_low,
+            estimated_cost_high=cost_high,
+        )
+    except Exception as exc:
+        # Observability must never crash the response path.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Observability record failed for job %s: %s", job_id, exc
+        )
+
+
 def _serialize_result(state: AgentState) -> dict[str, Any]:
     rec = state.get("system_design_recommendation")
     v1_rec = state.get("recommendation")
     tf_files = state.get("terraform_files")
     tn = state.get("technical_needs")
+    requirements = state.get("requirements")
     candidates = state.get("instance_candidates")
     result: dict[str, Any] = {}
     if rec is not None:
@@ -315,6 +442,11 @@ def _serialize_result(state: AgentState) -> dict[str, Any]:
             result["technical_needs"] = tn.model_dump(mode="json")
         else:
             result["technical_needs"] = tn
+    if requirements is not None:
+        if hasattr(requirements, "model_dump"):
+            result["user_requirements"] = requirements.model_dump(mode="json")
+        else:
+            result["user_requirements"] = requirements
     if candidates:
         result["instance_candidates"] = [
             c.model_dump(mode="json") if hasattr(c, "model_dump") else c
@@ -394,8 +526,16 @@ def get_stats() -> dict[str, Any]:
 
 
 @app.post("/api/recommend")
-def create_recommend_job(req: RecommendRequest) -> dict[str, Any]:
+def create_recommend_job(request: Request, req: RecommendRequest) -> dict[str, Any]:
     """Kick off a new agent run. Returns immediately with a job_id to poll."""
+    client_id = request.client.host if request.client else "unknown"
+    allowed, retry_after = recommend_rate_limiter.allow(client_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many recommendation requests. Please try again shortly.",
+            headers={"Retry-After": str(retry_after)},
+        )
     job_id = str(uuid.uuid4())
     state = _empty_state()
     state["latest_user_message"] = req.message
@@ -440,3 +580,21 @@ def answer_question(job_id: str, req: AnswerRequest) -> dict[str, Any]:
     _submit_with_timeout(_resume_with_answer_sync, job_id, req.answer)
 
     return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/api/runs")
+def get_runs(page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    """
+    Return paginated run history from the observability store.
+
+    When DATABASE_URL is not configured, returns an empty list with
+    ``observability_configured: false`` — not an error.
+
+    Query params:
+      page      (int, default 1)      — 1-based page number
+      page_size (int, default 20)     — rows per page, capped at 100
+    """
+    from app.observability import get_runs as _get_runs
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    return _get_runs(page=page, page_size=page_size)

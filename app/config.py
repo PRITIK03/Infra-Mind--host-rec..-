@@ -8,12 +8,15 @@ needs one group isn't blocked by unrelated missing variables.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(RuntimeError):
@@ -105,6 +108,32 @@ def get_tavily_settings() -> TavilySettings:
 
 
 @dataclass(frozen=True)
+class ObservabilitySettings:
+    """
+    Optional observability config.
+
+    database_url: SQLAlchemy-compatible URL for run-history persistence
+    (e.g. ``postgresql+psycopg2://user:pass@host/db`` for Neon/Supabase,
+    or ``sqlite:///./runs.db`` for local development).
+    When None, run summaries are logged to stdout only — no DB required.
+    """
+
+    database_url: str | None = None
+
+
+def get_observability_settings() -> ObservabilitySettings:
+    """Load observability settings.  Gracefully returns an unconfigured
+    instance when DATABASE_URL is absent — matching the Tavily skip pattern."""
+    raw = (os.getenv("DATABASE_URL") or "").strip() or None
+    if raw is None:
+        logger.debug(
+            "DATABASE_URL is unset; observability DB persistence disabled. "
+            "Run summaries will be logged to stdout only."
+        )
+    return ObservabilitySettings(database_url=raw)
+
+
+@dataclass(frozen=True)
 class APISettings:
     """Config for the FastAPI HTTP layer exposing the agent."""
 
@@ -113,8 +142,14 @@ class APISettings:
 
 
 def get_api_settings() -> APISettings:
-    """Loads and validates API-related settings only."""
+    """Load API settings without silently widening production CORS."""
+    origin = (os.getenv("CORS_ALLOWED_ORIGIN") or "").strip()
+    if not origin:
+        logger.warning(
+            "CORS_ALLOWED_ORIGIN is unset; cross-origin browser requests are disabled. "
+            "Set it explicitly for each environment."
+        )
     return APISettings(
-        cors_allowed_origin=_require("CORS_ALLOWED_ORIGIN"),
+        cors_allowed_origin=origin,
         port=_optional_int("PORT", 8000),
     )

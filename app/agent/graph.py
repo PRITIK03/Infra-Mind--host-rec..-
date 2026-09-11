@@ -10,6 +10,7 @@ from langgraph.graph import END, StateGraph
 
 from app.agent.nodes.cache_researcher import research_cache
 from app.agent.nodes.database_researcher import research_database
+from app.agent.nodes.grounding_check import grounding_check
 from app.agent.nodes.holistic_recommender import holistic_recommend
 from app.agent.nodes.instance_researcher import research_instances
 from app.agent.nodes.recommender import recommend_instance
@@ -34,6 +35,7 @@ def build_graph():
     graph.add_node("research_database", research_database)
     graph.add_node("research_cache", research_cache)
     graph.add_node("holistic_recommend", holistic_recommend)
+    graph.add_node("grounding_check", grounding_check)
     graph.add_node("generate_terraform", generate_terraform)
 
     graph.set_entry_point("collect_requirements")
@@ -49,7 +51,8 @@ def build_graph():
     graph.add_edge("research_instances", "research_database")
     graph.add_edge("research_database", "research_cache")
     graph.add_edge("research_cache", "holistic_recommend")
-    graph.add_edge("holistic_recommend", "generate_terraform")
+    graph.add_edge("holistic_recommend", "grounding_check")
+    graph.add_edge("grounding_check", "generate_terraform")
     graph.add_edge("generate_terraform", END)
 
     return graph.compile()

@@ -20,6 +20,7 @@ from app.models.schemas import (
     CacheRecommendation,
     DatabaseCandidate,
     DatabaseRecommendation,
+    EstimatedCost,
     InstanceCandidate,
     InstanceRecommendation,
     LoadBalancerRecommendation,
@@ -54,13 +55,17 @@ def _needs(**kw) -> TechnicalNeeds:
     return TechnicalNeeds(**base)
 
 
-def _compute_candidate(instance_type: str, vcpu: int = 2, mem: float = 8.0) -> InstanceCandidate:
-    return InstanceCandidate(instance_type=instance_type, vcpu=vcpu, memory_gib=mem)
+def _compute_candidate(instance_type: str, vcpu: int = 2, mem: float = 8.0, price: float | None = 0.096) -> InstanceCandidate:
+    return InstanceCandidate(
+        instance_type=instance_type, vcpu=vcpu, memory_gib=mem,
+        hourly_price_usd=price,
+    )
 
 
-def _db_candidate(instance_type: str, vcpu: int = 2, mem: float = 8.0) -> DatabaseCandidate:
+def _db_candidate(instance_type: str, vcpu: int = 2, mem: float = 8.0, price: float | None = 0.23) -> DatabaseCandidate:
     return DatabaseCandidate(
-        instance_type=instance_type, family="General purpose", vcpu=vcpu, memory_gib=mem
+        instance_type=instance_type, family="General purpose", vcpu=vcpu, memory_gib=mem,
+        hourly_price_usd=price,
     )
 
 
@@ -69,9 +74,11 @@ def _cache_candidate(
     engine: CacheEngine,
     vcpu: int = 2,
     mem: float = 6.0,
+    price: float | None = 0.173,
 ) -> CacheCandidate:
     return CacheCandidate(
-        instance_type=instance_type, family="Standard", engine=engine, vcpu=vcpu, memory_gib=mem
+        instance_type=instance_type, family="Standard", engine=engine, vcpu=vcpu, memory_gib=mem,
+        hourly_price_usd=price,
     )
 
 
@@ -172,6 +179,7 @@ def test_needs_database_false_sets_needed_false_without_llm_db(mock_invoke):
 
     assert sdr.database.needed is False
     assert sdr.database.recommended_instance is None
+    assert sdr.database.why == "Not required for this workload."
 
 
 @patch("app.agent.nodes.holistic_recommender.invoke_structured")
@@ -193,6 +201,24 @@ def test_needs_cache_false_sets_needed_false_without_llm_cache(mock_invoke):
     assert sdr.cache.needed is False
     assert sdr.cache.recommended_instance is None
     assert sdr.cache.engine is None
+    assert sdr.cache.why == "Not required for this workload."
+
+
+@patch("app.agent.nodes.holistic_recommender.invoke_structured")
+def test_skipped_tier_uses_relevant_reasoning_excerpt(mock_invoke):
+    mock_invoke.return_value = _full_result()
+    reasoning = (
+        "The workload is steady and does not need a persistent database because "
+        "the application has no durable relational data."
+    )
+    state = _base_state(
+        technical_needs=_needs(needs_database=False, reasoning=reasoning),
+        database_candidates=[],
+    )
+
+    sdr = recommend_system_design(state)["system_design_recommendation"]
+
+    assert sdr.database.why == reasoning
 
 
 @patch("app.agent.nodes.holistic_recommender.invoke_structured")
@@ -379,3 +405,101 @@ def test_missing_compute_candidates_raises(mock_invoke):
     with pytest.raises(HolisticRecommendationError):
         recommend_system_design(state)
     mock_invoke.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Estimated cost computation
+# ---------------------------------------------------------------------------
+
+
+@patch("app.agent.nodes.holistic_recommender.invoke_structured")
+def test_estimated_cost_populated_when_all_pricing_available(mock_invoke):
+    """All tiers have pricing → cost fields populated."""
+    mock_invoke.return_value = _full_result()
+    out = recommend_system_design(_base_state())
+    cost = out["system_design_recommendation"].estimated_cost
+
+    assert cost is not None
+    # m5.large price = 0.096, min=1 max=1 → 0.096 × 730 = 70.08
+    assert cost.compute_monthly_low == 70.08
+    assert cost.total_monthly_low == round(70.08 + 167.9 + 126.29, 2)
+    assert cost.total_monthly_high == round(70.08 + 167.9 + 126.29, 2)
+
+
+@patch("app.agent.nodes.holistic_recommender.invoke_structured")
+def test_estimated_cost_compute_range_with_multiple_instances(mock_invoke):
+    """min=2, max=6 → compute cost spans a range."""
+    mock_invoke.return_value = _full_result()
+    state = _base_state()
+    state["technical_needs"] = _needs(
+        min_instances=2, max_instances=6, load_balancer_needed=True
+    )
+    out = recommend_system_design(state)
+    cost = out["system_design_recommendation"].estimated_cost
+
+    assert cost is not None
+    # 0.096 × 2 × 730 = 140.16
+    assert cost.compute_monthly_low == 140.16
+    # 0.096 × 6 × 730 = 420.48
+    assert cost.compute_monthly_high == 420.48
+    assert cost.compute_monthly_low < cost.compute_monthly_high
+
+
+@patch("app.agent.nodes.holistic_recommender.invoke_structured")
+def test_estimated_cost_none_when_compute_pricing_unavailable(mock_invoke):
+    """Compute candidate has no price → all costs None."""
+    mock_invoke.return_value = _full_result(cache_type="cache.t3.medium", cache_engine=CacheEngine.REDIS)
+    state = _base_state()
+    state["instance_candidates"] = [_compute_candidate("m5.large", price=None)]
+    state["database_candidates"] = [_db_candidate("db.t3.medium", price=None)]
+    state["cache_candidates"] = [_cache_candidate("cache.t3.medium", CacheEngine.REDIS, price=None)]
+    out = recommend_system_design(state)
+    cost = out["system_design_recommendation"].estimated_cost
+
+    assert cost is not None
+    assert cost.compute_monthly_low is None
+    assert cost.compute_monthly_high is None
+    assert cost.database_monthly is None
+    assert cost.cache_monthly is None
+    assert cost.total_monthly_low is None
+    assert cost.total_monthly_high is None
+
+
+@patch("app.agent.nodes.holistic_recommender.invoke_structured")
+def test_estimated_cost_skipped_tiers_not_priced(mock_invoke):
+    """When DB/cache not needed, their costs are None."""
+    result = _full_result()
+    mock_invoke.return_value = result
+    state = _base_state(
+        technical_needs=_needs(needs_database=False, needs_cache=False),
+        database_candidates=[],
+        cache_candidates=[],
+    )
+    out = recommend_system_design(state)
+    cost = out["system_design_recommendation"].estimated_cost
+
+    assert cost is not None
+    assert cost.compute_monthly_low is not None  # compute is priced
+    assert cost.database_monthly is None
+    assert cost.cache_monthly is None
+    # Total includes only compute
+    assert cost.total_monthly_low == cost.compute_monthly_low
+    assert cost.total_monthly_high == cost.compute_monthly_high
+
+
+@patch("app.agent.nodes.holistic_recommender.invoke_structured")
+def test_estimated_cost_partial_pricing_partial_total(mock_invoke):
+    """DB has price, cache candidates have None → cache cost None, total None."""
+    result = _full_result(cache_type="cache.t3.medium", cache_engine=CacheEngine.REDIS)
+    mock_invoke.return_value = result
+    state = _base_state()
+    state["cache_candidates"] = [_cache_candidate("cache.t3.medium", CacheEngine.REDIS, price=None)]
+    out = recommend_system_design(state)
+    cost = out["system_design_recommendation"].estimated_cost
+
+    assert cost is not None
+    assert cost.compute_monthly_low is not None
+    assert cost.database_monthly is not None
+    assert cost.cache_monthly is None
+    assert cost.total_monthly_low is None  # can't sum with None
+    assert cost.total_monthly_high is None

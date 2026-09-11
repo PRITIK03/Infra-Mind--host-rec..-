@@ -6,8 +6,12 @@ The project has two parts that work together:
 
 ```
 aws-instance-advisor/       ← Python backend (FastAPI + LangGraph agent)
-aws-advisor-ui/             ← Next.js frontend (chat UI + results dashboard)
+../aws-advisor-ui/          ← canonical Next.js frontend (chat UI + results dashboard)
 ```
+
+The frontend deployment root is the sibling `aws-advisor-ui` directory at the
+workspace root. Do not deploy or recreate a second frontend under this backend
+directory.
 
 ---
 
@@ -69,10 +73,27 @@ Open `.env` and set:
 | `VANTAGE_API_KEY` | Yes | [Vantage](https://www.vantage.sh/) API key for live EC2 pricing data |
 | `TAVILY_API_KEY` | No | Enables a web-search round during reasoning. Agent works without it. |
 | `API_KEY_2` | No | Second OpenRouter key for automatic rate-limit failover |
-| `CORS_ALLOWED_ORIGIN` | Yes | Set to `http://localhost:3000` for local dev |
+| `CORS_ALLOWED_ORIGIN` | Yes | Explicit frontend origin; use `http://localhost:3000` locally and the real Vercel domain in production |
 | `PORT` | No | FastAPI port (default `8000`) |
+| `RATE_LIMIT_MAX_REQUESTS` | No | Recommendation requests allowed per client IP per window (default `5`) |
+| `RATE_LIMIT_WINDOW_SECONDS` | No | Recommendation rate-limit window (default `60`) |
 
 ### 3. Start the backend API
+
+From the repository workspace root (`D:\! Sciqus Internship\AWS Agent` on
+Windows), run:
+
+```powershell
+Set-Location .\aws-instance-advisor
+& .\.venv\Scripts\Activate.ps1
+python -m uvicorn app.api.main:app --reload --port 8000
+```
+
+Do not run `uvicorn main:app` from the workspace root: there is no root
+`main.py`; the ASGI application is `app.api.main:app`.
+
+Alternatively, after activating the environment, run the following while
+already inside `aws-instance-advisor`:
 
 ```bash
 uvicorn app.api.main:app --reload --port 8000
@@ -103,6 +124,16 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 ```
 
 ### 5. Start the frontend
+
+In a second terminal, from the workspace root:
+
+```powershell
+Set-Location .\aws-advisor-ui
+npm install
+npm run dev
+```
+
+Or, if you are already inside `aws-advisor-ui`, run:
 
 ```bash
 npm run dev
@@ -142,6 +173,12 @@ docker run -p 8000:8000 --env-file .env infra-mind
 ```
 
 > The Docker image runs the API server only. For the frontend, run `npm run dev` locally or deploy `aws-advisor-ui` separately (e.g. Vercel — set `NEXT_PUBLIC_API_URL` to your deployed backend URL in the Vercel project settings).
+
+The recommendation endpoint has a small process-local per-IP rate limit because
+each request consumes LLM and live-data quota. The job store is also intentionally
+process-local for now: jobs are lost on server restart and are not shared across
+workers or instances. Before horizontal scaling or durable job history, replace it
+with a shared Redis-backed store.
 
 ---
 

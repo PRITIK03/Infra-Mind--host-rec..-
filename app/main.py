@@ -67,8 +67,33 @@ def main() -> None:
                 print(f"Load balancer needed: {tn.load_balancer_needed}")
                 print(f"Reasoning: {tn.reasoning}")
 
-            print("\n--- Architecture Summary ---")
-            print(rec.architecture_summary)
+             print("\n--- Architecture Summary ---")
+             print(rec.architecture_summary)
+
+             # Estimated monthly cost
+             ec = getattr(rec, "estimated_cost", None)
+             if ec is not None:
+                 print("\n--- Estimated Monthly Cost (on-demand, us-east-1) ---")
+                 cl = ec.compute_monthly_low
+                 ch = ec.compute_monthly_high
+                 if cl is not None and ch is not None:
+                     print(f"  Compute: ${cl:.2f} - ${ch:.2f} /mo ({tn.min_instances}-{tn.max_instances} instances × 730h)")
+                 elif cl is not None:
+                     print(f"  Compute: ${cl:.2f} /mo")
+                 else:
+                     print("  Compute: pricing unavailable")
+                 if ec.database_monthly is not None:
+                     print(f"  Database: ${ec.database_monthly:.2f} /mo")
+                 else:
+                     print("  Database: pricing unavailable")
+                 if ec.cache_monthly is not None:
+                     print(f"  Cache: ${ec.cache_monthly:.2f} /mo")
+                 else:
+                     print("  Cache: pricing unavailable")
+                 tl = ec.total_monthly_low
+                 th = ec.total_monthly_high
+                 if tl is not None and th is not None:
+                     print(f"  Total: ${tl:.2f} - ${th:.2f} /mo")
 
             print("\n--- Component Recommendations ---")
 

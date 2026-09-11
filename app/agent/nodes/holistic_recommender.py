@@ -25,6 +25,7 @@ Key design invariants:
 from __future__ import annotations
 
 import json
+import re
 
 from app.agent.nodes._recommendation_utils import (
     allowed_cache_pairs,
@@ -40,6 +41,7 @@ from app.models.schemas import (
     CacheRecommendation,
     DatabaseCandidate,
     DatabaseRecommendation,
+    EstimatedCost,
     InstanceCandidate,
     InstanceRecommendation,
     LoadBalancerRecommendation,
@@ -190,19 +192,109 @@ def _format_cache(candidates: list[CacheCandidate]) -> str:
 
 # ── Short-circuit constructors for skipped tiers ──────────────────────────
 
-def _skipped_database() -> DatabaseRecommendation:
+def _tier_reasoning(reasoning: str, tier: str) -> str:
+    """Use model reasoning only when it explicitly discusses the skipped tier."""
+    keywords = {
+        "database": ("database", "db", "rds", "storage", "relational", "persistence"),
+        "cache": ("cache", "caching", "redis", "memcached", "valkey"),
+    }[tier]
+    lowered = reasoning.lower()
+    if not any(re.search(rf"\b{re.escape(keyword)}\b", lowered) for keyword in keywords):
+        return "Not required for this workload."
+    excerpt = reasoning.strip()[:240].strip()
+    return excerpt or "Not required for this workload."
+
+
+def _skipped_database(reasoning: str) -> DatabaseRecommendation:
     return DatabaseRecommendation(
         needed=False,
-        why="Not required for this workload.",
+        why=_tier_reasoning(reasoning, "database"),
         confidence="high",
     )
 
 
-def _skipped_cache() -> CacheRecommendation:
+def _skipped_cache(reasoning: str) -> CacheRecommendation:
     return CacheRecommendation(
         needed=False,
-        why="Not required for this workload.",
+        why=_tier_reasoning(reasoning, "cache"),
         confidence="high",
+    )
+
+
+# ── Cost estimation ────────────────────────────────────────────────────────────
+
+_HOURS_PER_MONTH = 730
+
+
+def _find_price(
+    candidates: list, instance_type: str | None
+) -> float | None:
+    """Look up the hourly on-demand price for an instance type from candidates."""
+    if instance_type is None:
+        return None
+    for c in candidates:
+        if c.instance_type == instance_type:
+            return getattr(c, "hourly_price_usd", None)
+    return None
+
+
+def _compute_estimated_cost(
+    sdr: SystemDesignRecommendation,
+    tn: TechnicalNeeds,
+    compute_candidates: list[InstanceCandidate],
+    db_candidates: list[DatabaseCandidate],
+    cache_candidates: list[CacheCandidate],
+) -> EstimatedCost:
+    """
+    Compute an estimated monthly on-demand cost from live pricing data.
+
+    Compute: min/max instances × recommended instance hourly price × 730h.
+    Database & cache: single-instance hourly price × 730h.
+    Any tier whose price is unavailable (None) surfaces as None — never fabricated.
+    """
+    compute_price = _find_price(compute_candidates, sdr.compute.recommended_instance)
+    db_price = None
+    cache_price = None
+
+    if sdr.database.needed and sdr.database.recommended_instance:
+        db_price = _find_price(db_candidates, sdr.database.recommended_instance)
+
+    if sdr.cache.needed and sdr.cache.recommended_instance:
+        cache_price = _find_price(cache_candidates, sdr.cache.recommended_instance)
+
+    compute_low = None
+    compute_high = None
+    if compute_price is not None:
+        compute_low = round(compute_price * tn.min_instances * _HOURS_PER_MONTH, 2)
+        compute_high = round(compute_price * tn.max_instances * _HOURS_PER_MONTH, 2)
+
+    db_monthly = round(db_price * _HOURS_PER_MONTH, 2) if db_price is not None else None
+    cache_monthly = round(cache_price * _HOURS_PER_MONTH, 2) if cache_price is not None else None
+
+    total_low = None
+    total_high = None
+    parts_low = [compute_low, db_monthly, cache_monthly]
+    parts_high = [compute_high, db_monthly, cache_monthly]
+    # A tier that is not needed contributes 0 to the total; a tier that is
+    # needed but whose price is unavailable makes the total uncomputable.
+    db_needed = sdr.database.needed and sdr.database.recommended_instance
+    cache_needed = sdr.cache.needed and sdr.cache.recommended_instance
+    unresolved = (
+        (compute_low is None) or
+        (db_needed and db_monthly is None) or
+        (cache_needed and cache_monthly is None)
+    )
+    if not unresolved:
+        total_low = round(sum(p or 0 for p in parts_low), 2)
+        total_high = round(sum(p or 0 for p in parts_high), 2)
+
+    return EstimatedCost(
+        compute_monthly_low=compute_low,
+        compute_monthly_high=compute_high,
+        database_monthly=db_monthly,
+        cache_monthly=cache_monthly,
+        total_monthly_low=total_low,
+        total_monthly_high=total_high,
     )
 
 
@@ -420,9 +512,19 @@ def recommend_system_design(state: AgentState) -> AgentState:
     # If the workload doesn't need a tier, replace whatever the LLM said
     # with the canonical needed=False value constructed in code.
     if not needs.needs_database:
-        result = result.model_copy(update={"database": _skipped_database()})
+        result = result.model_copy(update={"database": _skipped_database(needs.reasoning)})
     if not needs.needs_cache:
-        result = result.model_copy(update={"cache": _skipped_cache()})
+        result = result.model_copy(update={"cache": _skipped_cache(needs.reasoning)})
+
+    # ── Compute estimated monthly cost from live pricing ──────────────────────
+    # None when pricing data is unavailable for any needed tier.
+    result = result.model_copy(
+        update={
+            "estimated_cost": _compute_estimated_cost(
+                result, needs, compute_candidates, db_candidates, cache_candidates
+            )
+        }
+    )
 
     state["system_design_recommendation"] = result
     return state

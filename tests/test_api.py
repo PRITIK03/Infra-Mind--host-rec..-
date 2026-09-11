@@ -23,7 +23,8 @@ os.environ.setdefault("CORS_ALLOWED_ORIGIN", "http://localhost:3000")
 os.environ.setdefault("PORT", "8000")
 
 from app.api import jobs as jobs_module
-from app.api.main import app
+from app.api.main import app, recommend_rate_limiter
+from app.config import get_api_settings
 from app.models.schemas import (
     CacheCandidate,
     CacheEngine,
@@ -63,6 +64,12 @@ def _get(path: str) -> httpx.Response:
 
 def _post(path: str, json: Any = None) -> httpx.Response:
     return _http("POST", path, json=json)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Keep process-local rate-limit state isolated between API tests."""
+    recommend_rate_limiter.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +306,50 @@ def test_health_endpoint():
     assert body["status"] == "ok"
     assert "time" in body
     assert isinstance(body["time"], float)
+
+
+def test_cors_origin_is_empty_and_warns_when_unset(monkeypatch, caplog):
+    """Unset CORS config never falls back to a localhost origin."""
+    monkeypatch.delenv("CORS_ALLOWED_ORIGIN", raising=False)
+    with caplog.at_level("WARNING"):
+        settings = get_api_settings()
+    assert settings.cors_allowed_origin == ""
+    assert "CORS_ALLOWED_ORIGIN is unset" in caplog.text
+
+
+def test_recommend_rate_limit_returns_429_after_five_requests():
+    """Expensive public recommendation creation is limited per client IP."""
+    recommend_rate_limiter.clear()
+    with patch("app.api.main._submit_with_timeout"):
+        responses = [
+            _post("/api/recommend", json={"message": "test workload"})
+            for _ in range(5)
+        ]
+        blocked = _post("/api/recommend", json={"message": "test workload"})
+
+    assert all(response.status_code == 200 for response in responses)
+    assert blocked.status_code == 429
+    assert blocked.headers["retry-after"].isdigit()
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["", "   \n\t", "x" * 10_001],
+)
+def test_recommend_rejects_blank_or_oversized_messages(message):
+    """Public request validation does not rely on the frontend."""
+    response = _post("/api/recommend", json={"message": message})
+    assert response.status_code == 422
+
+
+def test_answer_rejects_blank_or_oversized_answers():
+    """Follow-up input is bounded before it can reach the agent."""
+    for answer in ("   ", "x" * 2_001):
+        response = _post(
+            "/api/recommend/not-a-real-job/answer",
+            json={"answer": answer},
+        )
+        assert response.status_code == 422
 
 
 def test_recommend_creates_job_and_returns_id():

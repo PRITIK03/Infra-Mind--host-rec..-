@@ -120,6 +120,7 @@ STAGE_LABELS: dict[str, str] = {
     "research_database": "Researching database options",
     "research_cache": "Researching cache options",
     "holistic_recommend": "Building final recommendation",
+    "grounding_check": "Checking recommendation consistency",
     "generate_terraform": "Generating Terraform",
 }
 

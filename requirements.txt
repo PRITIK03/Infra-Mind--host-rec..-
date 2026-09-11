@@ -10,3 +10,4 @@ pytest
 instances-api-client
 fastapi
 uvicorn
+sqlalchemy
