@@ -2,16 +2,17 @@
 
 An AI agent that gathers your workload requirements, reasons about system design, researches live AWS instance data across compute, database, and cache tiers, and recommends the optimal setup — with deployable Terraform files generated automatically.
 
-The project has two parts that work together:
+This workspace has two sibling projects that work together:
 
 ```
 aws-instance-advisor/       ← Python backend (FastAPI + LangGraph agent)
 ../aws-advisor-ui/          ← canonical Next.js frontend (chat UI + results dashboard)
 ```
 
-The frontend deployment root is the sibling `aws-advisor-ui` directory at the
-workspace root. Do not deploy or recreate a second frontend under this backend
-directory.
+`aws-instance-advisor` is the backend git repository. The canonical frontend is
+the sibling `aws-advisor-ui` directory at the workspace root; there is no nested
+frontend copy under this backend repository. Do not deploy or recreate a second
+frontend under `aws-instance-advisor`.
 
 ---
 
@@ -182,6 +183,28 @@ with a shared Redis-backed store.
 
 ---
 
+## Deploying to Vercel
+
+Deploy the backend first, separately from Vercel, using the existing
+`aws-instance-advisor/Dockerfile` on a container host such as Render, Railway,
+or Fly. Configure the backend with its required server-side environment
+variables, including `CORS_ALLOWED_ORIGIN` set to the final Vercel frontend
+origin.
+
+Deploy the frontend from the canonical `aws-advisor-ui` directory. In Vercel,
+set this required environment variable:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NEXT_PUBLIC_API_URL` | Yes | Public HTTPS URL of the deployed backend API, without a trailing slash. |
+
+This workspace is organized as sibling backend/frontend projects, not as a
+single git monorepo at the workspace root. If these folders are later combined
+into one monorepo, the Vercel project must set **Root Directory** to
+`aws-advisor-ui` so Vercel builds the Next.js app instead of the backend.
+
+---
+
 ## Project structure
 
 ```
@@ -199,12 +222,15 @@ aws-instance-advisor/
 │   │       ├── cache_researcher.py
 │   │       ├── holistic_recommender.py
 │   │       ├── recommender.py
-│   │       └── terraform_generator.py
+│   │       ├── terraform_generator.py  # Orchestrator
+│   │       └── terraform/              # Per-resource Terraform builders
 │   ├── api/
 │   │   ├── main.py                # FastAPI app + job endpoints
 │   │   └── jobs.py                # In-memory job store
 │   ├── llm/
-│   │   └── client.py              # OpenRouter LLM client
+│   │   ├── client.py              # OpenRouter LLM client factory
+│   │   ├── retry.py               # Bounded retry and key failover
+│   │   └── structured.py          # Structured output parsing/cache
 │   ├── models/
 │   │   └── schemas.py             # Pydantic data models
 │   ├── tools/
@@ -219,6 +245,8 @@ aws-instance-advisor/
 ├── requirements.txt
 └── .env.example
 ```
+
+The frontend lives outside this backend repository at `../aws-advisor-ui/`.
 
 ---
 
