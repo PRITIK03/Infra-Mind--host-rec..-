@@ -29,6 +29,7 @@ Table schema (``run_history``)
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -95,7 +96,8 @@ CREATE TABLE IF NOT EXISTS run_history (
     retry_count          INTEGER     NOT NULL DEFAULT 0,
     grounding_passed     BOOLEAN,
     estimated_cost_low   FLOAT,
-    estimated_cost_high  FLOAT
+    estimated_cost_high  FLOAT,
+    recommendation_snapshot TEXT
 )
 """
 
@@ -109,7 +111,8 @@ CREATE TABLE IF NOT EXISTS run_history (
     retry_count          INTEGER     NOT NULL DEFAULT 0,
     grounding_passed     INTEGER,
     estimated_cost_low   FLOAT,
-    estimated_cost_high  FLOAT
+    estimated_cost_high  FLOAT,
+    recommendation_snapshot TEXT
 )
 """
 
@@ -123,6 +126,14 @@ def _ensure_table(engine: Any) -> None:
     )
     with engine.begin() as conn:
         conn.execute(_text(ddl))
+
+    from sqlalchemy import inspect  # type: ignore[import]
+    columns = {column["name"] for column in inspect(engine).get_columns("run_history")}
+    if "recommendation_snapshot" not in columns:
+        with engine.begin() as conn:
+            conn.execute(_text(
+                "ALTER TABLE run_history ADD COLUMN recommendation_snapshot TEXT"
+            ))
 
 
 def _text(sql: str) -> Any:
@@ -143,6 +154,7 @@ def persist_run(
     grounding_passed: bool | None,
     estimated_cost_low: float | None,
     estimated_cost_high: float | None,
+    recommendation_snapshot: dict[str, Any] | None = None,
 ) -> None:
     """
     Persist one row to run_history.  No-op (stdout log only) when DB is
@@ -172,10 +184,12 @@ def persist_run(
                     """
                     INSERT INTO run_history
                         (job_id, total_latency_s, model_used, retry_count,
-                         grounding_passed, estimated_cost_low, estimated_cost_high)
+                         grounding_passed, estimated_cost_low, estimated_cost_high,
+                         recommendation_snapshot)
                     VALUES
                         (:job_id, :total_latency_s, :model_used, :retry_count,
-                         :grounding_passed, :estimated_cost_low, :estimated_cost_high)
+                         :grounding_passed, :estimated_cost_low, :estimated_cost_high,
+                         :recommendation_snapshot)
                     ON CONFLICT (job_id) DO NOTHING
                     """
                 ),
@@ -187,6 +201,10 @@ def persist_run(
                     "grounding_passed": grounding_passed,
                     "estimated_cost_low": estimated_cost_low,
                     "estimated_cost_high": estimated_cost_high,
+                    "recommendation_snapshot": (
+                        json.dumps(recommendation_snapshot, separators=(",", ":"))
+                        if recommendation_snapshot is not None else None
+                    ),
                 },
             )
     except Exception as exc:  # pragma: no cover
@@ -225,7 +243,7 @@ def get_runs(*, page: int = 1, page_size: int = 20) -> dict[str, Any]:
                 _text(
                     "SELECT job_id, timestamp, total_latency_s, model_used, "
                     "retry_count, grounding_passed, estimated_cost_low, "
-                    "estimated_cost_high "
+                    "estimated_cost_high, recommendation_snapshot "
                     "FROM run_history "
                     "ORDER BY timestamp DESC "
                     "LIMIT :limit OFFSET :offset"
@@ -243,6 +261,7 @@ def get_runs(*, page: int = 1, page_size: int = 20) -> dict[str, Any]:
                 "grounding_passed": bool(r[5]) if r[5] is not None else None,
                 "estimated_cost_low": r[6],
                 "estimated_cost_high": r[7],
+                "recommendation_snapshot": json.loads(r[8]) if r[8] else None,
             }
             for r in rows
         ]

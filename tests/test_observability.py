@@ -120,6 +120,16 @@ def test_persist_run_writes_row(sqlite_db):
         grounding_passed=True,
         estimated_cost_low=5.50,
         estimated_cost_high=8.20,
+        recommendation_snapshot={
+            "compute_instance": "m6g.large",
+            "database_instance": "db.t3.small",
+            "database_engine": "PostgreSQL",
+            "cache_instance": None,
+            "cache_engine": None,
+            "load_balancer_type": "Application Load Balancer",
+            "min_instances": 2,
+            "max_instances": 6,
+        },
     )
 
     result = get_runs()
@@ -135,6 +145,16 @@ def test_persist_run_writes_row(sqlite_db):
     assert row["grounding_passed"] is True
     assert abs(row["estimated_cost_low"] - 5.50) < 0.01
     assert abs(row["estimated_cost_high"] - 8.20) < 0.01
+    assert row["recommendation_snapshot"] == {
+        "compute_instance": "m6g.large",
+        "database_instance": "db.t3.small",
+        "database_engine": "PostgreSQL",
+        "cache_instance": None,
+        "cache_engine": None,
+        "load_balancer_type": "Application Load Balancer",
+        "min_instances": 2,
+        "max_instances": 6,
+    }
 
 
 def test_persist_run_null_fields_accepted(sqlite_db):

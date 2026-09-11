@@ -398,6 +398,24 @@ def _record_completed_run(
                 cost_low = getattr(cost, "total_monthly_low", None)
                 cost_high = getattr(cost, "total_monthly_high", None)
 
+        recommendation_snapshot = None
+        if sdr is not None:
+            cache_engine = getattr(getattr(sdr, "cache", None), "engine", None)
+            technical_needs = state.get("technical_needs")
+            recommendation_snapshot = {
+                "compute_instance": getattr(getattr(sdr, "compute", None), "recommended_instance", None),
+                "compute_monthly": getattr(cost, "compute_monthly_low", None) if cost is not None else None,
+                "database_instance": getattr(getattr(sdr, "database", None), "recommended_instance", None),
+                "database_engine": getattr(getattr(sdr, "database", None), "engine_suggestion", None),
+                "database_monthly": getattr(cost, "database_monthly", None) if cost is not None else None,
+                "cache_instance": getattr(getattr(sdr, "cache", None), "recommended_instance", None),
+                "cache_engine": getattr(cache_engine, "value", cache_engine),
+                "cache_monthly": getattr(cost, "cache_monthly", None) if cost is not None else None,
+                "load_balancer_type": getattr(getattr(sdr, "load_balancer", None), "load_balancer_type", None),
+                "min_instances": getattr(technical_needs, "min_instances", None),
+                "max_instances": getattr(technical_needs, "max_instances", None),
+            }
+
         persist_run(
             job_id=job_id,
             total_latency_s=total_latency_s,
@@ -406,6 +424,7 @@ def _record_completed_run(
             grounding_passed=grounding_passed,
             estimated_cost_low=cost_low,
             estimated_cost_high=cost_high,
+            recommendation_snapshot=recommendation_snapshot,
         )
     except Exception as exc:
         # Observability must never crash the response path.
@@ -489,7 +508,7 @@ def health() -> dict[str, Any]:
 # counts don't change mid-session.
 _stats_cache: dict[str, Any] = {}
 _stats_cache_time: float = 0.0
-_STATS_TTL_S: float = 600.0
+_STATS_TTL_S: float = 300.0
 
 
 @app.get("/api/stats")
