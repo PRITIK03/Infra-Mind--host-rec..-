@@ -224,6 +224,15 @@ def _enter_full_mock_stack(exit_stack: contextlib.ExitStack) -> None:
     def _fake_holistic(state):
         return {**state, "system_design_recommendation": sys_rec}
 
+    def _fake_grounding(state):
+        # Pass-through: mark grounding as passed on whatever SDR is present.
+        sdr = state.get("system_design_recommendation")
+        if sdr is not None:
+            state = {**state, "system_design_recommendation": sdr.model_copy(
+                update={"grounding_passed": True, "grounding_notes": []}
+            )}
+        return state
+
     def _fake_tf(state):
         return {**state, "terraform_files": tf_files}
 
@@ -248,6 +257,9 @@ def _enter_full_mock_stack(exit_stack: contextlib.ExitStack) -> None:
     )
     exit_stack.enter_context(
         patch("app.agent.graph.holistic_recommend", side_effect=_fake_holistic)
+    )
+    exit_stack.enter_context(
+        patch("app.agent.graph.grounding_check", side_effect=_fake_grounding)
     )
     exit_stack.enter_context(
         patch("app.agent.graph.generate_terraform", side_effect=_fake_tf)
@@ -486,6 +498,14 @@ def test_awaiting_input_scenario_surfaces_question_and_accepts_answer():
     def _fake_holistic_node(state):
         return {**state, "system_design_recommendation": sys_rec}
 
+    def _fake_grounding_node(state):
+        sdr = state.get("system_design_recommendation")
+        if sdr is not None:
+            state = {**state, "system_design_recommendation": sdr.model_copy(
+                update={"grounding_passed": True, "grounding_notes": []}
+            )}
+        return state
+
     def _fake_tf_node(state):
         return {**state, "terraform_files": tf_files}
 
@@ -517,6 +537,10 @@ def test_awaiting_input_scenario_surfaces_question_and_accepts_answer():
         patch(
             "app.agent.graph.holistic_recommend",
             side_effect=_fake_holistic_node,
+        ),
+        patch(
+            "app.agent.graph.grounding_check",
+            side_effect=_fake_grounding_node,
         ),
         patch(
             "app.agent.graph.generate_terraform",
@@ -613,6 +637,7 @@ def test_stage_label_mapping_covers_all_v2_nodes():
         "research_database",
         "research_cache",
         "holistic_recommend",
+        "grounding_check",
         "generate_terraform",
     }
     for node in v2_nodes:
